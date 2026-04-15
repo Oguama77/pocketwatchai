@@ -9,11 +9,18 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useNavigate, useLocation } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { clearUserProfile, getUserInitials } from "@/lib/userProfile";
 
 export function TopNav() {
   const { toggleSidebar, setAuthenticated } = useAppStore();
   const navigate = useNavigate();
   const location = useLocation();
+  const [initials, setInitials] = useState(() => getUserInitials());
+
+  useEffect(() => {
+    setInitials(getUserInitials());
+  }, [location.pathname]);
 
   const pageTitle = location.pathname === "/chat" ? "Chat" : "Dashboard";
 
@@ -46,7 +53,9 @@ export function TopNav() {
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" className="h-8 w-8 rounded-full p-0 ml-2">
               <Avatar className="h-8 w-8">
-                <AvatarFallback className="bg-primary text-primary-foreground text-xs font-semibold">JD</AvatarFallback>
+                <AvatarFallback className="bg-primary text-primary-foreground text-xs font-semibold">
+                  {initials}
+                </AvatarFallback>
               </Avatar>
             </Button>
           </DropdownMenuTrigger>
@@ -61,6 +70,7 @@ export function TopNav() {
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={() => {
+                clearUserProfile();
                 setAuthenticated(false);
                 navigate("/login");
               }}

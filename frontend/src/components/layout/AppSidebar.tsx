@@ -5,8 +5,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 export function AppSidebar() {
+  const navigate = useNavigate();
   const {
     conversations,
     activeConversationId,
@@ -40,7 +42,10 @@ export function AppSidebar() {
           <span className="font-semibold text-sidebar-foreground text-lg">PocketWatch</span>
         </div>
         <Button
-          onClick={createConversation}
+          onClick={() => {
+            createConversation();
+            navigate("/chat");
+          }}
           className="w-full gap-2"
           size="sm"
         >

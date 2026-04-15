@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAppStore } from "@/store/useAppStore";
+import { saveUserProfileFromLogin } from "@/lib/userProfile";
 
 export default function Login() {
   const [email, setEmail] = useState("");
@@ -14,6 +15,7 @@ export default function Login() {
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
+    saveUserProfileFromLogin(email);
     setAuthenticated(true);
     navigate("/");
   };

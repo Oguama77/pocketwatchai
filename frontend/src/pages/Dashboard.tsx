@@ -6,6 +6,7 @@ import { FileUpload } from "@/components/dashboard/FileUpload";
 import { useEffect, useState } from "react";
 import type { AnalyticsResponse } from "@/types/analytics";
 import { fetchAnalytics } from "@/lib/api";
+import { getGreetingFirstName } from "@/lib/userProfile";
 
 const EMPTY_ANALYTICS: AnalyticsResponse = {
   sessionId: "",
@@ -26,6 +27,11 @@ export default function Dashboard() {
   const [analytics, setAnalytics] = useState<AnalyticsResponse>(EMPTY_ANALYTICS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [greetingName, setGreetingName] = useState(() => getGreetingFirstName());
+
+  useEffect(() => {
+    setGreetingName(getGreetingFirstName());
+  }, []);
 
   useEffect(() => {
     const sessionId = localStorage.getItem("pocketwatch_session_id");
@@ -46,7 +52,7 @@ export default function Dashboard() {
     <AppLayout>
       <div className="p-6 max-w-7xl mx-auto space-y-6">
         <div>
-          <h2 className="text-2xl font-bold mb-1">Welcome back, John</h2>
+          <h2 className="text-2xl font-bold mb-1">Welcome back, {greetingName}</h2>
           <p className="text-muted-foreground text-sm">Here's your financial overview</p>
         </div>
 

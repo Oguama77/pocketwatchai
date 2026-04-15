@@ -23,7 +23,8 @@ export function ChatInterface() {
   }, [activeConversation?.messages.length]);
 
   const handleSend = async () => {
-    if (!input.trim()) return;
+    const question = input.trim();
+    if (!question) return;
 
     let convId = activeConversationId;
     if (!convId) {
@@ -33,7 +34,7 @@ export function ChatInterface() {
     addMessage(convId, {
       id: generateId(),
       role: "user",
-      content: input.trim(),
+      content: question,
       timestamp: new Date(),
     });
     setInput("");
@@ -41,7 +42,7 @@ export function ChatInterface() {
 
     try {
       const sessionId = localStorage.getItem("pocketwatch_session_id") || undefined;
-      const response = await askFinanceQuestion(input.trim(), sessionId);
+      const response = await askFinanceQuestion(question, sessionId);
       addMessage(convId!, {
         id: generateId(),
         role: "assistant",
@@ -61,6 +62,8 @@ export function ChatInterface() {
     }
   };
 
+  const hasUploadedSession = Boolean(localStorage.getItem("pocketwatch_session_id"));
+
   return (
     <div className="flex flex-col h-full">
       {/* Messages */}
@@ -73,7 +76,9 @@ export function ChatInterface() {
               </div>
               <h2 className="text-xl font-semibold mb-2">How can I help with your finances?</h2>
               <p className="text-muted-foreground text-sm max-w-md mx-auto">
-                Ask me about your spending, budgets, savings goals, or upload a financial statement to get started.
+                {hasUploadedSession
+                  ? "Ask about your uploaded statement (totals, categories, trends) or any general personal finance topic."
+                  : "Upload a statement on the dashboard for answers tied to your file, or ask general questions about budgeting, saving, and investing."}
               </p>
             </div>
           )}
