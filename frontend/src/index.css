@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 10%;
+
+    --primary: 155 93% 14%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 150 20% 95%;
+    --secondary-foreground: 155 93% 14%;
+
+    --muted: 150 10% 96%;
+    --muted-foreground: 0 0% 45%;
+
+    --accent: 150 30% 92%;
+    --accent-foreground: 155 93% 14%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 155 93% 14%;
+
+    --radius: 0.625rem;
+
+    --sidebar-background: 150 15% 97%;
+    --sidebar-foreground: 0 0% 20%;
+    --sidebar-primary: 155 93% 14%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 150 25% 93%;
+    --sidebar-accent-foreground: 155 93% 14%;
+    --sidebar-border: 0 0% 90%;
+    --sidebar-ring: 155 93% 14%;
+
+    /* Custom tokens */
+    --chat-user: 150 30% 92%;
+    --chat-ai: 0 0% 96%;
+    --chart-1: 155 93% 14%;
+    --chart-2: 155 70% 25%;
+    --chart-3: 150 50% 35%;
+    --chart-4: 148 40% 45%;
+    --chart-5: 145 35% 55%;
+    --chart-6: 142 30% 65%;
+    --shadow-card: 0 0% 0% / 0.05;
+  }
+
+  .dark {
+    --background: 155 20% 5%;
+    --foreground: 150 10% 95%;
+    --card: 155 15% 8%;
+    --card-foreground: 150 10% 95%;
+    --popover: 155 15% 8%;
+    --popover-foreground: 150 10% 95%;
+    --primary: 150 60% 45%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 155 20% 12%;
+    --secondary-foreground: 150 10% 95%;
+    --muted: 155 15% 15%;
+    --muted-foreground: 150 10% 60%;
+    --accent: 155 20% 15%;
+    --accent-foreground: 150 10% 95%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 155 15% 18%;
+    --input: 155 15% 18%;
+    --ring: 150 60% 45%;
+    --sidebar-background: 155 15% 7%;
+    --sidebar-foreground: 150 10% 90%;
+    --sidebar-primary: 150 60% 45%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 155 20% 12%;
+    --sidebar-accent-foreground: 150 10% 90%;
+    --sidebar-border: 155 15% 18%;
+    --sidebar-ring: 150 60% 45%;
+    --chat-user: 155 20% 15%;
+    --chat-ai: 155 10% 12%;
+    --chart-1: 150 60% 45%;
+    --chart-2: 150 50% 35%;
+    --chart-3: 148 40% 30%;
+    --chart-4: 145 35% 25%;
+    --chart-5: 142 30% 20%;
+    --chart-6: 140 25% 15%;
+    --shadow-card: 0 0% 0% / 0.2;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer utilities {
+  .chat-bubble-user {
+    @apply bg-[hsl(var(--chat-user))] text-foreground;
+  }
+  .chat-bubble-ai {
+    @apply bg-[hsl(var(--chat-ai))] text-foreground;
+  }
+}
+
+/* Animations */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-in-left {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes chart-grow {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.4s ease-out forwards;
+}
+
+.animate-slide-in-left {
+  animation: slide-in-left 0.3s ease-out forwards;
+}
