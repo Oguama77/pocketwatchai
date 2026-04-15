@@ -7,14 +7,44 @@ export interface ChatResponse {
   route: "document" | "general";
 }
 
+function assertHttpsApiInProduction(): void {
+  if (typeof window === "undefined") return;
+  if (window.location.protocol !== "https:") return;
+  if (API_BASE.startsWith("http://") && !API_BASE.includes("127.0.0.1") && !API_BASE.includes("localhost")) {
+    throw new Error(
+      "VITE_API_BASE_URL must use https:// when the site is served over HTTPS (mixed content blocks the request).",
+    );
+  }
+}
+
+function mapNetworkError(url: string, err: unknown): Error {
+  const hint =
+    "Check that the backend is running, VITE_API_BASE_URL matches your API (HTTPS on production), " +
+    "and Render CORS_ORIGINS includes this site's origin. Large PDFs can also crash a small instance—try CSV export or increase MAX_PDF_PAGES.";
+  if (err instanceof TypeError) {
+    return new Error(`Network error calling ${url}. ${hint} (${err.message})`);
+  }
+  if (err instanceof Error && err.message.toLowerCase().includes("fetch")) {
+    return new Error(`Network error calling ${url}. ${hint}`);
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 export async function uploadFinancialDocument(file: File): Promise<AnalyticsResponse> {
+  assertHttpsApiInProduction();
   const form = new FormData();
   form.append("file", file);
 
-  const res = await fetch(`${API_BASE}/api/upload`, {
-    method: "POST",
-    body: form,
-  });
+  const url = `${API_BASE}/api/upload`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      body: form,
+    });
+  } catch (e) {
+    throw mapNetworkError(url, e);
+  }
   if (!res.ok) {
     throw new Error(await extractError(res, "Failed to upload document."));
   }
@@ -22,7 +52,14 @@ export async function uploadFinancialDocument(file: File): Promise<AnalyticsResp
 }
 
 export async function fetchAnalytics(sessionId: string): Promise<AnalyticsResponse> {
-  const res = await fetch(`${API_BASE}/api/analytics/${sessionId}`);
+  assertHttpsApiInProduction();
+  const url = `${API_BASE}/api/analytics/${sessionId}`;
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    throw mapNetworkError(url, e);
+  }
   if (!res.ok) {
     throw new Error(await extractError(res, "Failed to load analytics."));
   }
@@ -30,11 +67,18 @@ export async function fetchAnalytics(sessionId: string): Promise<AnalyticsRespon
 }
 
 export async function askFinanceQuestion(question: string, sessionId?: string): Promise<ChatResponse> {
-  const res = await fetch(`${API_BASE}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, sessionId }),
-  });
+  assertHttpsApiInProduction();
+  const url = `${API_BASE}/api/chat`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, sessionId }),
+    });
+  } catch (e) {
+    throw mapNetworkError(url, e);
+  }
   if (!res.ok) {
     throw new Error(await extractError(res, "Failed to get chat response."));
   }

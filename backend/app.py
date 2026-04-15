@@ -71,26 +71,48 @@ def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=renames)
 
 
-def _extract_tables_from_pdf(content: bytes) -> pd.DataFrame:
+def _max_pdf_pages() -> int:
+    """Cap pages processed to avoid OOM / very long requests on small hosts (e.g. Render free tier)."""
+    try:
+        return max(1, min(500, int(os.getenv("MAX_PDF_PAGES", "100"))))
+    except ValueError:
+        return 100
+
+
+def _max_upload_bytes() -> int:
+    try:
+        return max(1_048_576, int(os.getenv("MAX_UPLOAD_BYTES", str(30 * 1024 * 1024))))
+    except ValueError:
+        return 30 * 1024 * 1024
+
+
+def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
+    """One pdfplumber pass: faster and roughly half the peak memory vs opening the PDF twice."""
+    max_pages = _max_pdf_pages()
     rows: list[list[str]] = []
+    text_chunks: list[str] = []
     with pdfplumber.open(io.BytesIO(content)) as pdf:
-        for page in pdf.pages:
+        total = len(pdf.pages)
+        for page in pdf.pages[:max_pages]:
             table = page.extract_table()
             if table:
                 rows.extend(table)
+            text_chunks.append(page.extract_text() or "")
     if not rows:
-        raise HTTPException(status_code=400, detail="Could not extract a table from this PDF.")
+        hint = (
+            f"No table found in the first {max_pages} page(s) of this PDF."
+            if total > max_pages
+            else "Could not extract a table from this PDF."
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{hint} Try exporting CSV from your bank, or set MAX_PDF_PAGES higher on the server.",
+        )
     header = [str(h or "").strip() for h in rows[0]]
     body = rows[1:]
-    return pd.DataFrame(body, columns=header)
-
-
-def _extract_text_from_pdf(content: bytes) -> str:
-    chunks: list[str] = []
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            chunks.append(page.extract_text() or "")
-    return "\n".join(chunks).strip()
+    df = pd.DataFrame(body, columns=header)
+    text = "\n".join(text_chunks).strip()
+    return df, text
 
 
 def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str]:
@@ -103,9 +125,7 @@ def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str
         df = pd.read_excel(io.BytesIO(content))
         return df, df.to_csv(index=False)
     if suffix == ".pdf":
-        df = _extract_tables_from_pdf(content)
-        text = _extract_text_from_pdf(content)
-        return df, text
+        return _load_pdf_tables_and_text(content)
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or Excel.")
 
 
@@ -292,9 +312,18 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
 
 app = FastAPI(title="PocketWatch Backend")
 
+
+def _cors_allow_origins() -> list[str]:
+    raw = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    )
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -309,6 +338,12 @@ def health() -> dict[str, str]:
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)) -> dict:
     content = await file.read()
+    max_bytes = _max_upload_bytes()
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(content)} bytes). Maximum is {max_bytes} bytes.",
+        )
     df_raw, source_text = _load_dataframe(file, content)
     df, currency = _prepare_financial_df(df_raw)
     analytics = _build_analytics(df, currency)
