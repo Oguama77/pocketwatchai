@@ -5,3 +5,7 @@ pandas
 pdfplumber
 openpyxl
 openai
+langchain
+langchain-openai
+langchain-community
+duckduckgo-search

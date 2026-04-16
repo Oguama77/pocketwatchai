@@ -7,17 +7,27 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import pdfplumber
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover
     OpenAI = None
+
+try:
+    from langchain_core.tools import tool
+    from langchain_openai import ChatOpenAI
+    from langchain_community.tools import DuckDuckGoSearchResults
+except ImportError:  # pragma: no cover
+    tool = None
+    ChatOpenAI = None
+    DuckDuckGoSearchResults = None
 
 
 CANONICAL_COLUMNS = {
@@ -586,7 +596,7 @@ def _build_analytics(df: pd.DataFrame, currency: str) -> dict:
     }
 
 
-def _fallback_chat(question: str, session: SessionData | None) -> tuple[str, str]:
+def _fallback_chat(question: str, session: SessionData | None) -> tuple[str, str, str]:
     q = question.lower()
     if session and any(token in q for token in ("spend", "expense", "spent", "income", "balance", "transaction")):
         summary = session.analytics["summary"]
@@ -596,57 +606,195 @@ def _fallback_chat(question: str, session: SessionData | None) -> tuple[str, str
             f"total expenses are {currency} {summary['totalExpenses']:,.2f}, "
             f"and net balance is {currency} {summary['netBalance']:,.2f}."
         )
-        return answer, "document"
+        return answer, "document", "fallback_document_summary"
     return (
         "For general finance: track fixed vs variable costs, build a 3-6 month emergency fund, "
         "and automate monthly investing after essential expenses.",
         "general",
+        "fallback_general_finance",
     )
 
 
-def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, str]:
+class CalcPlan(BaseModel):
+    operation: str = Field(default="sum_metric_on_date")
+    metric: str = Field(default="expense")
+    date: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+def _parse_date_safe(raw: str | None) -> pd.Timestamp | None:
+    if not raw:
+        return None
+    dt = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt
+
+
+def _split_text_chunks(text: str, chunk_size: int = 1200, overlap: int = 150) -> list[str]:
+    if not text.strip():
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def _retrieve_chunks(question: str, text: str, top_k: int = 4) -> list[str]:
+    chunks = _split_text_chunks(text)
+    if not chunks:
+        return []
+    terms = {w for w in re.findall(r"[a-zA-Z0-9]{3,}", question.lower())}
+    if not terms:
+        return chunks[:top_k]
+
+    scored: list[tuple[int, str]] = []
+    for ch in chunks:
+        low = ch.lower()
+        score = sum(1 for t in terms if t in low)
+        scored.append((score, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = [c for s, c in scored[:top_k] if s > 0]
+    return out if out else chunks[:top_k]
+
+
+def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, str, str]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
         return _fallback_chat(question, session)
 
-    client = OpenAI(api_key=api_key)
-    if session:
-        context = session.frame[["date", "description", "expense", "income"]].head(120).to_csv(index=False)
-    else:
-        context = "No statement uploaded."
-
-    router_prompt = (
-        "Classify user question as 'document' (about their uploaded statement) or "
-        "'general' (finance concepts). Return one word."
-    )
-    route_resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": router_prompt},
-            {"role": "user", "content": question},
-        ],
-        temperature=0,
-    )
-    route = route_resp.choices[0].message.content.strip().lower()
-    route = "document" if "document" in route else "general"
-
-    if route == "document" and session:
-        system = (
-            "You are a financial assistant. Answer using only the provided statement context. "
-            "If unknown, say you cannot find it in the statement."
+    # If LangChain or tooling deps are unavailable, keep the legacy OpenAI fallback path.
+    if ChatOpenAI is None or tool is None:
+        client = OpenAI(api_key=api_key)
+        answer_resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a practical personal finance advisor."},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.3,
         )
-        user = f"Context:\n{context}\n\nQuestion: {question}"
-    else:
-        system = "You are a practical personal finance advisor."
-        user = question
+        return answer_resp.choices[0].message.content.strip(), "general", "legacy_general_llm"
 
-    answer_resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.3,
-    )
-    answer = answer_resp.choices[0].message.content.strip()
-    return answer, route
+    llm = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0)
+    search_tool = DuckDuckGoSearchResults(max_results=5) if DuckDuckGoSearchResults is not None else None
+
+    @tool("general_finance_timeless")
+    def general_finance_timeless(question: str) -> str:
+        """Use for timeless finance education and concepts that don't need current events."""
+        resp = llm.invoke(
+            "You are a concise finance educator. Answer timeless concepts clearly, "
+            "with practical examples when useful. If a question needs up-to-date facts, say so briefly.\n\n"
+            f"Question: {question}"
+        )
+        return str(resp.content).strip()
+
+    @tool("general_finance_realtime_web")
+    def general_finance_realtime_web(question: str) -> str:
+        """Use for finance questions requiring current or recent information from the web."""
+        if search_tool is None:
+            return "Web search tool is unavailable on this server. Install langchain-community and duckduckgo-search."
+        search_results = str(search_tool.invoke(question))
+        resp = llm.invoke(
+            "You are a finance assistant using web results. Answer with current facts, "
+            "mention uncertainty where relevant, and include source URLs inline when possible.\n\n"
+            f"Question: {question}\n\nWeb results:\n{search_results}"
+        )
+        return str(resp.content).strip()
+
+    @tool("document_finance_calculations")
+    def document_finance_calculations(question: str) -> str:
+        """Use for calculation-heavy questions about uploaded statement data (totals on dates, sums over ranges)."""
+        if not session:
+            return "Please upload a statement first so I can run calculations on your document."
+        df = session.frame.copy()
+        planner = llm.with_structured_output(CalcPlan)
+        plan = planner.invoke(
+            "Extract a calculation plan from the user question.\n"
+            "Operations: sum_metric_on_date, total_metric, sum_metric_between_dates, avg_daily_metric.\n"
+            "Metric must be one of expense,income,balance,amount.\n"
+            "Return ISO dates (YYYY-MM-DD) when dates are provided.\n\n"
+            f"Question: {question}"
+        )
+        metric = plan.metric if plan.metric in {"expense", "income", "balance", "amount"} else "expense"
+
+        result_text = ""
+        if plan.operation == "sum_metric_on_date":
+            d = _parse_date_safe(plan.date)
+            if d is not None:
+                mask = df["date"].dt.date == d.date()
+                total = float(df.loc[mask, metric].sum()) if metric in df.columns else 0.0
+                result_text = f"{metric} on {d.date().isoformat()} = {session.currency} {total:,.2f}"
+        elif plan.operation == "sum_metric_between_dates":
+            d0 = _parse_date_safe(plan.start_date)
+            d1 = _parse_date_safe(plan.end_date)
+            if d0 is not None and d1 is not None and metric in df.columns:
+                mask = (df["date"] >= d0) & (df["date"] <= d1)
+                total = float(df.loc[mask, metric].sum())
+                result_text = (
+                    f"{metric} from {d0.date().isoformat()} to {d1.date().isoformat()} "
+                    f"= {session.currency} {total:,.2f}"
+                )
+        elif plan.operation == "avg_daily_metric":
+            if metric in df.columns and len(df):
+                by_day = df.groupby(df["date"].dt.date)[metric].sum()
+                avg = float(by_day.mean()) if len(by_day) else 0.0
+                result_text = f"average daily {metric} = {session.currency} {avg:,.2f}"
+        else:  # total_metric + unknown
+            if metric in df.columns:
+                total = float(df[metric].sum())
+                result_text = f"total {metric} = {session.currency} {total:,.2f}"
+
+        sample = df[["date", "description", "expense", "income"]].head(120).to_csv(index=False)
+        resp = llm.invoke(
+            "You are a financial assistant. Use the computed result and dataframe sample to answer. "
+            "If computed_result is empty, explain what data is missing and suggest a precise question.\n\n"
+            f"Question: {question}\nComputed_result: {result_text}\nData sample:\n{sample}"
+        )
+        return str(resp.content).strip()
+
+    @tool("document_finance_non_calculation")
+    def document_finance_non_calculation(question: str) -> str:
+        """Use for non-calculation questions about the uploaded document using chunked document text context."""
+        if not session:
+            return "Please upload a statement first so I can answer document-specific questions."
+        selected = _retrieve_chunks(question, session.source_text, top_k=4)
+        context = "\n\n---\n\n".join(selected) if selected else "No extracted statement text found."
+        resp = llm.invoke(
+            "You answer using only the statement chunks. If unknown, say it's not present in the document.\n\n"
+            f"Question: {question}\n\nStatement chunks:\n{context}"
+        )
+        return str(resp.content).strip()
+
+    tools = [
+        general_finance_timeless,
+        general_finance_realtime_web,
+        document_finance_calculations,
+        document_finance_non_calculation,
+    ]
+    router = llm.bind_tools(tools, tool_choice="auto")
+    routed = router.invoke(question)
+    if not getattr(routed, "tool_calls", None):
+        return general_finance_timeless.invoke({"question": question}), "general", "general_finance_timeless"
+
+    call = routed.tool_calls[0]
+    tool_name = str(call.get("name", ""))
+    tool_args = call.get("args", {}) or {}
+    tool_map: dict[str, tuple[Callable, str]] = {
+        "general_finance_timeless": (general_finance_timeless, "general"),
+        "general_finance_realtime_web": (general_finance_realtime_web, "general"),
+        "document_finance_calculations": (document_finance_calculations, "document"),
+        "document_finance_non_calculation": (document_finance_non_calculation, "document"),
+    }
+    selected_tool, route = tool_map.get(tool_name, (general_finance_timeless, "general"))
+    result = selected_tool.invoke(tool_args if isinstance(tool_args, dict) else {"question": question})
+    return str(result).strip(), route, (tool_name or "general_finance_timeless")
 
 
 app = FastAPI(title="PocketWatch Backend")
@@ -705,6 +853,6 @@ def chat(payload: ChatRequest) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     session = SESSIONS.get(payload.sessionId) if payload.sessionId else None
-    answer, route = _chat_with_model(question, session)
-    return {"answer": answer, "route": route}
+    answer, route, selected_tool = _chat_with_model(question, session)
+    return {"answer": answer, "route": route, "selectedTool": selected_tool}
 
