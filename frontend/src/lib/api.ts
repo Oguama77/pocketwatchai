@@ -21,6 +21,9 @@ function mapNetworkError(url: string, err: unknown): Error {
   const hint =
     "Check that the backend is running, VITE_API_BASE_URL matches your API (HTTPS on production), " +
     "and Render CORS_ORIGINS includes this site's origin. Large PDFs can also crash a small instance—try CSV export or increase MAX_PDF_PAGES.";
+  if (err instanceof DOMException && err.name === "AbortError") {
+    return new Error("Upload cancelled.");
+  }
   if (err instanceof TypeError) {
     return new Error(`Network error calling ${url}. ${hint} (${err.message})`);
   }
@@ -30,7 +33,10 @@ function mapNetworkError(url: string, err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
-export async function uploadFinancialDocument(file: File): Promise<AnalyticsResponse> {
+export async function uploadFinancialDocument(
+  file: File,
+  opts?: { signal?: AbortSignal },
+): Promise<AnalyticsResponse> {
   assertHttpsApiInProduction();
   const form = new FormData();
   form.append("file", file);
@@ -41,6 +47,7 @@ export async function uploadFinancialDocument(file: File): Promise<AnalyticsResp
     res = await fetch(url, {
       method: "POST",
       body: form,
+      signal: opts?.signal,
     });
   } catch (e) {
     throw mapNetworkError(url, e);

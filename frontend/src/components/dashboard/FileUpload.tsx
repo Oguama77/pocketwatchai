@@ -1,5 +1,5 @@
-import { Upload, FileText, Loader2, CheckCircle2 } from "lucide-react";
-import { useState, useCallback } from "react";
+import { Upload, FileText, Loader2, CheckCircle2, X } from "lucide-react";
+import { useState, useCallback, useRef } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { uploadFinancialDocument } from "@/lib/api";
@@ -11,23 +11,41 @@ interface FileUploadProps {
 
 export function FileUpload({ onUploaded }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const [files, setFiles] = useState<File[]>([]);
+  const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const processFile = useCallback(async (file: File) => {
+    // Cancel any in-flight request before starting a new one
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setError(null);
+    setFile(file);
     setUploadedFileName(file.name);
     setIsProcessing(true);
     try {
-      const response = await uploadFinancialDocument(file);
+      const response = await uploadFinancialDocument(file, { signal: controller.signal });
       localStorage.setItem("pocketwatch_session_id", response.sessionId);
       onUploaded(response);
     } catch (uploadErr) {
-      setError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
+      if (uploadErr instanceof Error && uploadErr.message === "Upload cancelled.") {
+        // User cancelled; clear state quietly
+        setUploadedFileName(null);
+        setFile(null);
+        setError(null);
+      } else {
+        setError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
+      }
     } finally {
       setIsProcessing(false);
+      abortRef.current = null;
     }
   }, [onUploaded]);
 
@@ -35,17 +53,25 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
     e.preventDefault();
     setIsDragging(false);
     const droppedFiles = Array.from(e.dataTransfer.files);
-    setFiles((prev) => [...prev, ...droppedFiles]);
     if (!droppedFiles.length) return;
-    await processFile(droppedFiles[0]);
+    const first = droppedFiles[0];
+    await processFile(first);
   }, [processFile]);
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
-    const selected = Array.from(e.target.files);
-    setFiles((prev) => [...prev, ...selected]);
-    const first = selected[0];
+    const first = e.target.files[0];
     await processFile(first);
+  };
+
+  const handleClear = () => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    setFile(null);
+    setUploadedFileName(null);
+    setError(null);
+    setIsProcessing(false);
   };
 
   return (
@@ -66,15 +92,43 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
             <Button size="sm" className="cursor-pointer" asChild disabled={isProcessing}>
               <span>{isProcessing ? "Processing..." : "Browse Files"}</span>
             </Button>
-            <input type="file" className="hidden" accept=".pdf,.csv,.xlsx,.xls" multiple onChange={handleFileInput} />
+            <input
+              type="file"
+              className="hidden"
+              accept=".pdf,.csv,.xlsx,.xls"
+              multiple={false}
+              onChange={handleFileInput}
+            />
           </label>
         </div>
         {uploadedFileName && (
           <div className="mt-3 rounded-md border bg-muted/40 px-3 py-2 text-sm">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-primary" />
-              <span className="font-medium">Uploaded:</span>
-              <span className="truncate">{uploadedFileName}</span>
+            <div className="flex items-center gap-2 justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <CheckCircle2 className="h-4 w-4 text-primary shrink-0" />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1">
+                    <span className="font-medium">Uploaded:</span>
+                    <span className="truncate">{uploadedFileName}</span>
+                  </div>
+                  {file && (
+                    <p className="text-[11px] text-muted-foreground">
+                      {(file.size / 1024).toFixed(1)} KB
+                    </p>
+                  )}
+                </div>
+              </div>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="h-7 w-7 shrink-0"
+                onClick={handleClear}
+                disabled={isProcessing}
+                title={isProcessing ? "Cancel upload" : "Remove file"}
+              >
+                {isProcessing ? <Loader2 className="h-3 w-3 animate-spin" /> : <X className="h-3 w-3" />}
+              </Button>
             </div>
             {isProcessing && (
               <div className="mt-2 flex items-center gap-2 text-muted-foreground">
@@ -85,16 +139,11 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
           </div>
         )}
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
-
-        {files.length > 0 && (
-          <div className="mt-4 space-y-2">
-            {files.map((f, i) => (
-              <div key={i} className="flex items-center gap-2 text-sm p-2 rounded-md bg-muted">
-                <FileText className="h-4 w-4 text-primary" />
-                <span className="truncate">{f.name}</span>
-                <span className="text-xs text-muted-foreground ml-auto">{(f.size / 1024).toFixed(1)} KB</span>
-              </div>
-            ))}
+        {file && !uploadedFileName && (
+          <div className="mt-4 flex items-center gap-2 text-sm p-2 rounded-md bg-muted">
+            <FileText className="h-4 w-4 text-primary" />
+            <span className="truncate">{file.name}</span>
+            <span className="text-xs text-muted-foreground ml-auto">{(file.size / 1024).toFixed(1)} KB</span>
           </div>
         )}
       </CardContent>
