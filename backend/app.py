@@ -828,36 +828,7 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
 
 app = FastAPI(title="PocketWatch Backend")
 
-
-def _cors_allow_origins() -> list[str]:
-    raw = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    )
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    # Only exact origins go in allow_origins. Wildcards are handled by regex.
-    return [o for o in origins if "*" not in o]
-
-
-def _cors_allow_origin_regex() -> str | None:
-    raw = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    )
-    wildcard_origins = [o.strip() for o in raw.split(",") if o.strip() and "*" in o]
-    regex_parts: list[str] = [
-        # Safe defaults for local dev and Vercel preview/prod subdomains.
-        r"https://.*\.vercel\.app",
-        r"http://localhost(:\d+)?",
-        r"http://127\.0\.0\.1(:\d+)?",
-    ]
-    # Convert entries like https://*.example.com to regex alternatives.
-    for origin in wildcard_origins:
-        escaped = re.escape(origin).replace(r"\*", ".*")
-        regex_parts.append(escaped)
-    return "^(" + "|".join(regex_parts) + ")$"
-
-
+# CORS: allow all origins (no credentials). CORS_ORIGINS env is not read here — wildcard + no paths.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -871,6 +842,17 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    """Avoid 404 on GET / (browsers, probes, Render health checks sometimes hit /)."""
+    return {"service": "pocketwatch-backend", "health": "/api/health"}
+
+
+@app.get("/health")
+def health_alias() -> dict[str, str]:
+    return health()
 
 
 @app.post("/api/upload")
