@@ -324,6 +324,66 @@ def _normalize_loaded_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _promote_best_header_row(df: pd.DataFrame, scan_rows: int = 10) -> pd.DataFrame:
+    """Auto-detect and promote a likely header row from the first `scan_rows` rows."""
+    if df.empty:
+        return df
+
+    n = min(scan_rows, len(df))
+    header_terms = {
+        "date",
+        "transaction date",
+        "value date",
+        "booking date",
+        "description",
+        "details",
+        "debit",
+        "credit",
+        "amount",
+        "balance",
+        "memo",
+        "payee",
+        "narrative",
+    }
+
+    best_idx = 0
+    best_score = -1.0
+    width = len(df.columns)
+
+    for i in range(n):
+        row = [str(v or "").strip() for v in df.iloc[i].tolist()]
+        non_empty = [c for c in row if c]
+        if not non_empty:
+            continue
+        norm = [_norm_col(c) for c in non_empty]
+        keyword_hits = sum(1 for c in norm if c in header_terms or "date" in c)
+        uniqueness = len(set(norm)) / max(1, len(non_empty))
+        fill_ratio = len(non_empty) / max(1, width)
+        score = (keyword_hits * 2.0) + uniqueness + fill_ratio
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx == 0:
+        return df
+
+    header = [str(v or "").strip() for v in df.iloc[best_idx].tolist()]
+    if not any(header):
+        return df
+
+    dedup_count: dict[str, int] = {}
+    normalized_header: list[str] = []
+    for h in header:
+        base = h if h else "column"
+        count = dedup_count.get(base, 0)
+        dedup_count[base] = count + 1
+        normalized_header.append(base if count == 0 else f"{base}_{count + 1}")
+
+    out = df.iloc[best_idx + 1 :].copy()
+    out.columns = normalized_header
+    return out.reset_index(drop=True)
+
+
 def _read_csv_with_bad_lines(buf: io.StringIO, **kwargs: object) -> pd.DataFrame:
     try:
         return pd.read_csv(buf, on_bad_lines="skip", **kwargs)  # type: ignore[arg-type]
@@ -397,6 +457,7 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         raise HTTPException(status_code=400, detail="Uploaded file has no rows.")
 
     df = _normalize_loaded_frame(df.copy())
+    df = _promote_best_header_row(df, scan_rows=10)
     df = _canonicalise_columns(df)
     inferred = _infer_date_column(df)
     if inferred is not None:

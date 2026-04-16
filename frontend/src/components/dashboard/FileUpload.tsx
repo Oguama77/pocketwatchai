@@ -1,4 +1,4 @@
-import { Upload, FileText } from "lucide-react";
+import { Upload, FileText, Loader2, CheckCircle2 } from "lucide-react";
 import { useState, useCallback } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -12,8 +12,24 @@ interface FileUploadProps {
 export function FileUpload({ onUploaded }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
-  const [isUploading, setIsUploading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const processFile = useCallback(async (file: File) => {
+    setError(null);
+    setUploadedFileName(file.name);
+    setIsProcessing(true);
+    try {
+      const response = await uploadFinancialDocument(file);
+      localStorage.setItem("pocketwatch_session_id", response.sessionId);
+      onUploaded(response);
+    } catch (uploadErr) {
+      setError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [onUploaded]);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
@@ -21,35 +37,15 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
     const droppedFiles = Array.from(e.dataTransfer.files);
     setFiles((prev) => [...prev, ...droppedFiles]);
     if (!droppedFiles.length) return;
-    setError(null);
-    setIsUploading(true);
-    try {
-      const response = await uploadFinancialDocument(droppedFiles[0]);
-      localStorage.setItem("pocketwatch_session_id", response.sessionId);
-      onUploaded(response);
-    } catch (uploadErr) {
-      setError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
-    } finally {
-      setIsUploading(false);
-    }
-  }, [onUploaded]);
+    await processFile(droppedFiles[0]);
+  }, [processFile]);
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
     const selected = Array.from(e.target.files);
     setFiles((prev) => [...prev, ...selected]);
     const first = selected[0];
-    setError(null);
-    setIsUploading(true);
-    try {
-      const response = await uploadFinancialDocument(first);
-      localStorage.setItem("pocketwatch_session_id", response.sessionId);
-      onUploaded(response);
-    } catch (uploadErr) {
-      setError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
-    } finally {
-      setIsUploading(false);
-    }
+    await processFile(first);
   };
 
   return (
@@ -67,12 +63,27 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
           <p className="text-sm font-medium mb-1">Drop your financial documents here</p>
           <p className="text-xs text-muted-foreground mb-3">PDF, CSV, or Excel files</p>
           <label>
-            <Button size="sm" className="cursor-pointer" asChild disabled={isUploading}>
-              <span>{isUploading ? "Uploading..." : "Browse Files"}</span>
+            <Button size="sm" className="cursor-pointer" asChild disabled={isProcessing}>
+              <span>{isProcessing ? "Processing..." : "Browse Files"}</span>
             </Button>
             <input type="file" className="hidden" accept=".pdf,.csv,.xlsx,.xls" multiple onChange={handleFileInput} />
           </label>
         </div>
+        {uploadedFileName && (
+          <div className="mt-3 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 text-primary" />
+              <span className="font-medium">Uploaded:</span>
+              <span className="truncate">{uploadedFileName}</span>
+            </div>
+            {isProcessing && (
+              <div className="mt-2 flex items-center gap-2 text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>Processing document and extracting insights...</span>
+              </div>
+            )}
+          </div>
+        )}
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
 
         {files.length > 0 && (
