@@ -860,9 +860,9 @@ def _cors_allow_origin_regex() -> str | None:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_allow_origins(),
-    allow_origin_regex=_cors_allow_origin_regex(),
-    allow_credentials=True,
+    allow_origins=["*"],
+    # Keep credentials disabled so wildcard CORS is valid in browsers.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
