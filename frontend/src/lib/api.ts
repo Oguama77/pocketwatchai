@@ -76,12 +76,15 @@ export async function fetchAnalytics(sessionId: string): Promise<AnalyticsRespon
 export async function askFinanceQuestion(question: string, sessionId?: string): Promise<ChatResponse> {
   assertHttpsApiInProduction();
   const url = `${API_BASE}/api/chat`;
+  const body = new URLSearchParams();
+  body.set("question", question);
+  if (sessionId) body.set("sessionId", sessionId);
   let res: Response;
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, sessionId }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body: body.toString(),
     });
   } catch (e) {
     throw mapNetworkError(url, e);

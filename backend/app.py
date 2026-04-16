@@ -11,7 +11,7 @@ from typing import Callable
 
 import pandas as pd
 import pdfplumber
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -899,7 +899,23 @@ def analytics(session_id: str) -> dict:
 
 
 @app.post("/api/chat")
-def chat(payload: ChatRequest) -> dict:
+async def chat(request: Request) -> dict:
+    content_type = request.headers.get("content-type", "").lower()
+    payload_data: dict = {}
+    if "application/json" in content_type:
+        try:
+            payload_data = await request.json()
+        except Exception:
+            payload_data = {}
+    elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        payload_data = dict(form)
+
+    try:
+        payload = ChatRequest(**payload_data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid chat payload. Provide 'question' and optional 'sessionId'.")
+
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
