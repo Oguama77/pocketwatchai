@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/store/useAppStore";
 import { cn } from "@/lib/utils";
-import { askFinanceQuestion } from "@/lib/api";
+import { askFinanceQuestion, type ChatHistoryMessage } from "@/lib/api";
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
@@ -31,6 +31,11 @@ export function ChatInterface() {
       convId = createConversation();
     }
 
+    const priorMessages = activeConversation?.messages ?? [];
+    const history: ChatHistoryMessage[] = priorMessages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+
     addMessage(convId, {
       id: generateId(),
       role: "user",
@@ -42,7 +47,7 @@ export function ChatInterface() {
 
     try {
       const sessionId = localStorage.getItem("pocketwatch_session_id") || undefined;
-      const response = await askFinanceQuestion(question, sessionId);
+      const response = await askFinanceQuestion(question, sessionId, history);
       addMessage(convId!, {
         id: generateId(),
         role: "assistant",

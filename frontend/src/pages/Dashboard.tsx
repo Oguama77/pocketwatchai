@@ -19,7 +19,7 @@ const EMPTY_ANALYTICS: AnalyticsResponse = {
     expenseChangePct: 0,
     netBalanceChangePct: 0,
   },
-  spendingOverTime: [],
+  topSpendingDays: [],
   categoryBreakdown: [],
 };
 
@@ -62,7 +62,7 @@ export default function Dashboard() {
         <SummaryCards summary={analytics.summary} currency={analytics.currency} />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <SpendingChart data={analytics.spendingOverTime} currency={analytics.currency} />
+          <SpendingChart data={analytics.topSpendingDays} currency={analytics.currency} />
           <CategoryChart data={analytics.categoryBreakdown} currency={analytics.currency} />
         </div>
       </div>

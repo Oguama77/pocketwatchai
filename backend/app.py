@@ -113,23 +113,83 @@ class SessionData:
 SESSIONS: dict[str, SessionData] = {}
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     question: str
     sessionId: str | None = None
+    history: list[ChatMessage] | None = None
 
 
 def _norm_col(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(name).strip().lower()).strip()
 
 
+def _parse_money(val: object) -> float | None:
+    """Parse a single money cell, robust to:
+      * Currency symbols / words (€, $, £, EUR, USD, ...)
+      * European format (1.234,56) and US format (1,234.56)
+      * Parentheses for negatives, e.g. "(123.45)"
+      * Trailing "DR" (debit/negative) and "CR" (credit/positive) markers
+      * Spaces, NBSPs, blank cells.
+    Returns None for unparseable / empty cells.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(f) else f
+
+    s = str(val).strip().replace("\u00a0", " ")
+    if not s or s in {"-", "—", "–", "nan", "NaN", "None"}:
+        return None
+
+    is_neg = False
+    if "(" in s and ")" in s:
+        is_neg = True
+        s = s.replace("(", "").replace(")", "")
+
+    upper = s.upper()
+    if re.search(r"\bDR\b", upper):
+        is_neg = True
+
+    s = re.sub(r"[^0-9,.\-]", "", s)
+    if not s or s in {"-", ".", ","}:
+        return None
+
+    if s.startswith("-"):
+        is_neg = True
+        s = s[1:]
+    s = s.replace("-", "")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 2:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    return -n if is_neg else n
+
+
 def _to_float(series: pd.Series) -> pd.Series:
-    cleaned = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace(" ", "", regex=False)
-        .str.replace(r"[^\d.\-]", "", regex=True)
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
+    parsed = series.map(_parse_money)
+    return pd.to_numeric(parsed, errors="coerce")
 
 
 def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -527,22 +587,28 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         if column in df.columns:
             df[column] = _to_float(df[column])
 
-    expense = pd.Series(0.0, index=df.index)
-    if "debit" in df.columns:
-        expense = df["debit"].fillna(0).clip(lower=0)
-    if "amount" in df.columns:
-        outgoing = df["amount"].where(df["amount"] < 0, other=0).abs()
-        expense = expense.where(expense > 0, outgoing)
-    if "balance" in df.columns:
-        bal_drop = (df["balance"].shift(1) - df["balance"]).clip(lower=0).fillna(0)
-        expense = expense.where(expense > 0, bal_drop)
+    has_debit = "debit" in df.columns
+    has_credit = "credit" in df.columns
+    has_amount = "amount" in df.columns
+    has_balance = "balance" in df.columns
 
+    expense = pd.Series(0.0, index=df.index)
     income = pd.Series(0.0, index=df.index)
-    if "credit" in df.columns:
-        income = df["credit"].fillna(0).clip(lower=0)
-    if "amount" in df.columns:
-        incoming = df["amount"].where(df["amount"] > 0, other=0)
-        income = income.where(income > 0, incoming)
+
+    if has_debit:
+        expense = df["debit"].fillna(0).abs()
+    if has_credit:
+        income = df["credit"].fillna(0).abs()
+
+    if not has_debit and has_amount:
+        expense = df["amount"].where(df["amount"] < 0, other=0).abs().fillna(0)
+    if not has_credit and has_amount:
+        income = df["amount"].where(df["amount"] > 0, other=0).fillna(0)
+
+    if not has_debit and not has_credit and not has_amount and has_balance:
+        diff = (df["balance"].shift(1) - df["balance"]).fillna(0)
+        expense = diff.clip(lower=0)
+        income = (-diff).clip(lower=0)
 
     df["expense"] = pd.to_numeric(expense, errors="coerce").fillna(0)
     df["income"] = pd.to_numeric(income, errors="coerce").fillna(0)
@@ -597,6 +663,13 @@ def _build_analytics(df: pd.DataFrame, currency: str) -> dict:
     current_net = current_income - current_expense
     prev_net = prev_income - prev_expense
 
+    daily_spending = work.groupby(work["date"].dt.date)["expense"].sum()
+    top_days = daily_spending[daily_spending > 0].sort_values(ascending=False).head(5)
+    top_spending_days = [
+        {"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "amount": float(amt)}
+        for d, amt in top_days.items()
+    ]
+
     work["category"] = work["description"].apply(_merchant_like_key)
     category_series = work.groupby("category")["expense"].sum().sort_values(ascending=False)
     total = float(category_series.sum())
@@ -616,13 +689,29 @@ def _build_analytics(df: pd.DataFrame, currency: str) -> dict:
             "expenseChangePct": _pct_change(current_expense, prev_expense),
             "netBalanceChangePct": _pct_change(current_net, prev_net),
         },
-        "spendingOverTime": [
-            {"month": month, "amount": float(amount)} for month, amount in monthly_spending.items()
-        ],
+        "topSpendingDays": top_spending_days,
         "categoryBreakdown": [
             {"name": name, "value": float(value)} for name, value in major.items()
         ],
     }
+
+
+def _format_history(history: list[ChatMessage] | None, max_turns: int = 8) -> str:
+    """Render recent conversation as a readable transcript for prompt injection."""
+    if not history:
+        return ""
+    recent = history[-max_turns * 2 :]
+    lines: list[str] = []
+    for msg in recent:
+        role = (msg.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {content}")
+    return "\n".join(lines)
 
 
 def _fallback_chat(question: str, session: SessionData | None) -> tuple[str, str, str]:
@@ -693,20 +782,33 @@ def _retrieve_chunks(question: str, text: str, top_k: int = 4) -> list[str]:
     return out if out else chunks[:top_k]
 
 
-def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, str, str]:
+def _chat_with_model(
+    question: str,
+    session: SessionData | None,
+    history: list[ChatMessage] | None = None,
+) -> tuple[str, str, str]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
         return _fallback_chat(question, session)
 
+    history_text = _format_history(history)
+    history_block = f"Recent conversation (for context):\n{history_text}\n\n" if history_text else ""
+
     # If LangChain or tooling deps are unavailable, keep the legacy OpenAI fallback path.
     if ChatOpenAI is None or tool is None:
         client = OpenAI(api_key=api_key)
+        chat_messages = [
+            {"role": "system", "content": "You are a practical personal finance advisor. Use the prior conversation for context when the user asks follow-up questions."},
+        ]
+        if history:
+            for m in history[-16:]:
+                role = (m.role or "").lower()
+                if role in {"user", "assistant"} and (m.content or "").strip():
+                    chat_messages.append({"role": role, "content": m.content})
+        chat_messages.append({"role": "user", "content": question})
         answer_resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a practical personal finance advisor."},
-                {"role": "user", "content": question},
-            ],
+            messages=chat_messages,
             temperature=0.3,
         )
         return answer_resp.choices[0].message.content.strip(), "general", "legacy_general_llm"
@@ -724,32 +826,38 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         """Use for timeless finance education and concepts that don't need current events."""
         resp = llm.invoke(
             "You are a concise finance educator. Answer timeless concepts clearly, "
-            "with practical examples when useful. If a question needs up-to-date facts, say so briefly.\n\n"
-            f"Question: {question}"
+            "with practical examples when useful. Use the prior conversation to resolve "
+            "follow-up references (pronouns like 'it', 'that', 'them' or implicit topics). "
+            "If a question needs up-to-date facts, say so briefly.\n\n"
+            f"{history_block}Current question: {question}"
         )
         return str(resp.content).strip()
 
     @tool("general_finance_realtime_web")
     def general_finance_realtime_web(question: str) -> str:
         """Use for finance questions requiring current or recent information from the web."""
+        search_query = question
+        if history_text:
+            search_query = f"{question} (context: {history_text[-400:]})"
         search_results: str = ""
         if search_tool is not None:
             try:
-                search_results = str(search_tool.invoke(question))
+                search_results = str(search_tool.invoke(search_query))
             except Exception as e:  # pragma: no cover
                 search_results = f"(search failed: {e})"
         if not search_results:
             resp = llm.invoke(
                 "You are a careful finance assistant. The server has no live web search available right now. "
-                "Answer the question with caveats about potentially outdated information and suggest "
-                "the user verify current data from an authoritative source.\n\n"
-                f"Question: {question}"
+                "Use the prior conversation for context. Answer with caveats about potentially "
+                "outdated information and suggest the user verify current data from an authoritative source.\n\n"
+                f"{history_block}Current question: {question}"
             )
             return str(resp.content).strip()
         resp = llm.invoke(
             "You are a finance assistant using web results. Answer with current facts, "
-            "mention uncertainty where relevant, and include source URLs inline when possible.\n\n"
-            f"Question: {question}\n\nWeb results:\n{search_results}"
+            "use prior conversation to resolve follow-ups, mention uncertainty where relevant, "
+            "and include source URLs inline when possible.\n\n"
+            f"{history_block}Current question: {question}\n\nWeb results:\n{search_results}"
         )
         return str(resp.content).strip()
 
@@ -761,11 +869,13 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         df = session.frame.copy()
         planner = llm.with_structured_output(CalcPlan)
         plan = planner.invoke(
-            "Extract a calculation plan from the user question.\n"
+            "Extract a calculation plan from the user question. "
+            "Use the prior conversation to resolve follow-up references such as 'that day', "
+            "'the same week', or implicit dates carried from previous turns.\n"
             "Operations: sum_metric_on_date, total_metric, sum_metric_between_dates, avg_daily_metric.\n"
             "Metric must be one of expense,income,balance,amount.\n"
             "Return ISO dates (YYYY-MM-DD) when dates are provided.\n\n"
-            f"Question: {question}"
+            f"{history_block}Current question: {question}"
         )
         metric = plan.metric if plan.metric in {"expense", "income", "balance", "amount"} else "expense"
 
@@ -799,8 +909,9 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         sample = df[["date", "description", "expense", "income"]].head(120).to_csv(index=False)
         resp = llm.invoke(
             "You are a financial assistant. Use the computed result and dataframe sample to answer. "
+            "Use prior conversation to handle follow-ups. "
             "If computed_result is empty, explain what data is missing and suggest a precise question.\n\n"
-            f"Question: {question}\nComputed_result: {result_text}\nData sample:\n{sample}"
+            f"{history_block}Current question: {question}\nComputed_result: {result_text}\nData sample:\n{sample}"
         )
         return str(resp.content).strip()
 
@@ -809,11 +920,13 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         """Use for non-calculation questions about the uploaded document using chunked document text context."""
         if not session:
             return "Please upload a statement first so I can answer document-specific questions."
-        selected = _retrieve_chunks(question, session.source_text, top_k=4)
+        retrieval_query = question if not history_text else f"{question}\n{history_text[-400:]}"
+        selected = _retrieve_chunks(retrieval_query, session.source_text, top_k=4)
         context = "\n\n---\n\n".join(selected) if selected else "No extracted statement text found."
         resp = llm.invoke(
-            "You answer using only the statement chunks. If unknown, say it's not present in the document.\n\n"
-            f"Question: {question}\n\nStatement chunks:\n{context}"
+            "You answer using only the statement chunks. Use prior conversation to "
+            "resolve follow-up references. If the answer is not present, say it's not in the document.\n\n"
+            f"{history_block}Current question: {question}\n\nStatement chunks:\n{context}"
         )
         return str(resp.content).strip()
 
@@ -824,7 +937,12 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         document_finance_non_calculation,
     ]
     router = llm.bind_tools(tools, tool_choice="auto")
-    routed = router.invoke(question)
+    routing_input = (
+        f"{history_block}Current question: {question}\n\n"
+        "Pick the single best tool to answer the current question, taking the recent "
+        "conversation into account so follow-ups are routed consistently with prior turns."
+    ) if history_text else question
+    routed = router.invoke(routing_input)
     if not getattr(routed, "tool_calls", None):
         return general_finance_timeless.invoke({"question": question}), "general", "general_finance_timeless"
 
@@ -898,6 +1016,8 @@ def analytics(session_id: str) -> dict:
 
 @app.post("/api/chat")
 async def chat(request: Request) -> dict:
+    import json as _json
+
     content_type = request.headers.get("content-type", "").lower()
     payload_data: dict = {}
     if "application/json" in content_type:
@@ -909,6 +1029,13 @@ async def chat(request: Request) -> dict:
         form = await request.form()
         payload_data = dict(form)
 
+    raw_history = payload_data.get("history")
+    if isinstance(raw_history, str):
+        try:
+            payload_data["history"] = _json.loads(raw_history) if raw_history.strip() else None
+        except Exception:
+            payload_data["history"] = None
+
     try:
         payload = ChatRequest(**payload_data)
     except Exception:
@@ -919,7 +1046,7 @@ async def chat(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     session = SESSIONS.get(payload.sessionId) if payload.sessionId else None
     try:
-        answer, route, selected_tool = _chat_with_model(question, session)
+        answer, route, selected_tool = _chat_with_model(question, session, payload.history)
     except Exception as e:  # pragma: no cover
         return {
             "answer": f"Chat failed on the server: {type(e).__name__}: {e}",

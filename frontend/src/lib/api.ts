@@ -5,6 +5,12 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 export interface ChatResponse {
   answer: string;
   route: "document" | "general";
+  selectedTool?: string;
+}
+
+export interface ChatHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
 }
 
 function assertHttpsApiInProduction(): void {
@@ -73,12 +79,19 @@ export async function fetchAnalytics(sessionId: string): Promise<AnalyticsRespon
   return res.json();
 }
 
-export async function askFinanceQuestion(question: string, sessionId?: string): Promise<ChatResponse> {
+export async function askFinanceQuestion(
+  question: string,
+  sessionId?: string,
+  history?: ChatHistoryMessage[],
+): Promise<ChatResponse> {
   assertHttpsApiInProduction();
   const url = `${API_BASE}/api/chat`;
   const body = new URLSearchParams();
   body.set("question", question);
   if (sessionId) body.set("sessionId", sessionId);
+  if (history && history.length > 0) {
+    body.set("history", JSON.stringify(history.slice(-16)));
+  }
   let res: Response;
   try {
     res = await fetch(url, {

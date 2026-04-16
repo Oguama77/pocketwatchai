@@ -7,8 +7,8 @@ export interface SummaryMetrics {
   netBalanceChangePct: number;
 }
 
-export interface SpendingPoint {
-  month: string;
+export interface TopSpendingDay {
+  date: string;
   amount: number;
 }
 
@@ -21,6 +21,6 @@ export interface AnalyticsResponse {
   sessionId: string;
   currency: string;
   summary: SummaryMetrics;
-  spendingOverTime: SpendingPoint[];
+  topSpendingDays: TopSpendingDay[];
   categoryBreakdown: CategoryPoint[];
 }
