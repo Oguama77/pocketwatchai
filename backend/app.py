@@ -204,6 +204,34 @@ def _infer_description_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _collapse_duplicate_columns(df: pd.DataFrame, preferred: str) -> pd.Series:
+    """Coalesce duplicate-named columns into one (left-most non-empty value wins)."""
+    selected = df.loc[:, df.columns == preferred]
+    if selected.empty:
+        return pd.Series(dtype="object")
+    if selected.shape[1] == 1:
+        return selected.iloc[:, 0]
+    out = selected.iloc[:, 0].copy()
+    for i in range(1, selected.shape[1]):
+        out = out.where(out.astype(str).str.strip() != "", selected.iloc[:, i])
+        out = out.where(out.notna(), selected.iloc[:, i])
+    return out
+
+
+def _dedupe_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prevent duplicate canonical columns (e.g., two 'date' columns) after renaming.
+    This avoids pandas datetime assembly errors like 'cannot assemble with duplicate keys'.
+    """
+    out = df.copy()
+    for name in ("date", "description", "debit", "credit", "amount", "balance"):
+        if (out.columns == name).sum() > 1:
+            merged = _collapse_duplicate_columns(out, name)
+            out = out.loc[:, out.columns != name]
+            out[name] = merged
+    return out
+
+
 def _max_pdf_pages() -> int:
     """Cap pages processed to avoid OOM / very long requests on small hosts (e.g. Render free tier)."""
     try:
@@ -469,6 +497,7 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     df = _normalize_loaded_frame(df.copy())
     df = _promote_best_header_row(df, scan_rows=10)
     df = _canonicalise_columns(df)
+    df = _dedupe_canonical_columns(df)
     inferred = _infer_date_column(df)
     if inferred is not None:
         df = inferred
