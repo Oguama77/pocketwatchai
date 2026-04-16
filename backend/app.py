@@ -712,7 +712,12 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
         return answer_resp.choices[0].message.content.strip(), "general", "legacy_general_llm"
 
     llm = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0)
-    search_tool = DuckDuckGoSearchResults(max_results=5) if DuckDuckGoSearchResults is not None else None
+    search_tool = None
+    if DuckDuckGoSearchResults is not None:
+        try:
+            search_tool = DuckDuckGoSearchResults(max_results=5)
+        except Exception:
+            search_tool = None
 
     @tool("general_finance_timeless")
     def general_finance_timeless(question: str) -> str:
@@ -727,9 +732,20 @@ def _chat_with_model(question: str, session: SessionData | None) -> tuple[str, s
     @tool("general_finance_realtime_web")
     def general_finance_realtime_web(question: str) -> str:
         """Use for finance questions requiring current or recent information from the web."""
-        if search_tool is None:
-            return "Web search tool is unavailable on this server. Install langchain-community and duckduckgo-search."
-        search_results = str(search_tool.invoke(question))
+        search_results: str = ""
+        if search_tool is not None:
+            try:
+                search_results = str(search_tool.invoke(question))
+            except Exception as e:  # pragma: no cover
+                search_results = f"(search failed: {e})"
+        if not search_results:
+            resp = llm.invoke(
+                "You are a careful finance assistant. The server has no live web search available right now. "
+                "Answer the question with caveats about potentially outdated information and suggest "
+                "the user verify current data from an authoritative source.\n\n"
+                f"Question: {question}"
+            )
+            return str(resp.content).strip()
         resp = llm.invoke(
             "You are a finance assistant using web results. Answer with current facts, "
             "mention uncertainty where relevant, and include source URLs inline when possible.\n\n"
@@ -902,6 +918,13 @@ async def chat(request: Request) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     session = SESSIONS.get(payload.sessionId) if payload.sessionId else None
-    answer, route, selected_tool = _chat_with_model(question, session)
+    try:
+        answer, route, selected_tool = _chat_with_model(question, session)
+    except Exception as e:  # pragma: no cover
+        return {
+            "answer": f"Chat failed on the server: {type(e).__name__}: {e}",
+            "route": "general",
+            "selectedTool": "error_fallback",
+        }
     return {"answer": answer, "route": route, "selectedTool": selected_tool}
 
