@@ -21,12 +21,74 @@ except ImportError:  # pragma: no cover
 
 
 CANONICAL_COLUMNS = {
-    "date": {"date", "transaction date", "booking date", "value date"},
-    "description": {"description", "details", "merchant", "narrative", "particulars"},
-    "debit": {"debit", "withdrawal", "outflow", "money out", "expense"},
-    "credit": {"credit", "deposit", "inflow", "money in", "income"},
-    "amount": {"amount", "transaction amount"},
-    "balance": {"balance", "running balance"},
+    "date": {
+        "date",
+        "transaction date",
+        "booking date",
+        "value date",
+        "posting date",
+        "posted date",
+        "post date",
+        "trans date",
+        "txn date",
+        "movement date",
+        "oper date",
+        "operation date",
+        "eff date",
+        "effective date",
+        "processing date",
+        "trade date",
+        "settlement date",
+        "dt",
+        "datum",
+        "fecha",
+        "valuta",
+        "booked on",
+        "day",
+    },
+    "description": {
+        "description",
+        "details",
+        "merchant",
+        "narrative",
+        "particulars",
+        "memo",
+        "payee",
+        "counterparty",
+        "beneficiary",
+        "narration",
+        "subject",
+        "booking text",
+        "transaction details",
+        "text",
+        "type",
+        "reference",
+        "note",
+        "notes",
+    },
+    "debit": {
+        "debit",
+        "withdrawal",
+        "outflow",
+        "money out",
+        "expense",
+        "debits",
+        "paid out",
+        "paid out amount",
+        "charge",
+    },
+    "credit": {
+        "credit",
+        "deposit",
+        "inflow",
+        "money in",
+        "income",
+        "credits",
+        "paid in",
+        "received",
+    },
+    "amount": {"amount", "transaction amount", "amt", "value", "sum"},
+    "balance": {"balance", "running balance", "closing balance", "account balance"},
 }
 
 
@@ -62,13 +124,74 @@ def _to_float(series: pd.Series) -> pd.Series:
 
 def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     renames: dict[str, str] = {}
+    description_loosely_assigned = False
     for col in df.columns:
-        normalized = _norm_col(col)
+        normalized = _norm_col(str(col))
+        matched = False
         for canonical, aliases in CANONICAL_COLUMNS.items():
             if normalized == canonical or normalized in aliases:
                 renames[col] = canonical
+                matched = True
                 break
+        if not matched:
+            if "date" in normalized and canonical_date_like(normalized):
+                renames[col] = "date"
+            elif not description_loosely_assigned and any(
+                k in normalized for k in ("memo", "narrative", "payee", "details", "description")
+            ):
+                renames[col] = "description"
+                description_loosely_assigned = True
     return df.rename(columns=renames)
+
+
+def canonical_date_like(normalized: str) -> bool:
+    """True if normalized header is plausibly a transaction date column name."""
+    skip = {"created date", "updated date", "import date", "export date", "statement date"}
+    if normalized in skip:
+        return False
+    return True
+
+
+def _infer_date_column(df: pd.DataFrame) -> pd.DataFrame | None:
+    """If no 'date' column, pick the column whose values parse best as datetimes."""
+    if "date" in df.columns:
+        return df
+    best_col: str | None = None
+    best_score = 0.0
+    for col in df.columns:
+        if str(col).strip() == "":
+            continue
+        ser = df[col].dropna().head(100)
+        if len(ser) < 3:
+            continue
+        parsed = pd.to_datetime(ser.astype(str), format="mixed", errors="coerce")
+        score = float(parsed.notna().mean())
+        if score > best_score:
+            best_score = score
+            best_col = str(col)
+    if best_col is not None and best_score >= 0.4:
+        out = df.rename(columns={best_col: "date"})
+        return out
+    return None
+
+
+def _infer_description_column(df: pd.DataFrame) -> pd.DataFrame:
+    """If no description, use first text-heavy column that is not the date."""
+    if "description" in df.columns:
+        return df
+    skip_norm = {"amount", "debit", "credit", "balance", "date"}
+    for col in df.columns:
+        if str(col) == "date":
+            continue
+        if _norm_col(str(col)) in skip_norm:
+            continue
+        ser = df[col].dropna().astype(str).head(50)
+        if ser.empty:
+            continue
+        avg_len = ser.str.len().mean()
+        if avg_len >= 8 and df[col].dtype == object:
+            return df.rename(columns={col: "description"})
+    return df
 
 
 def _max_pdf_pages() -> int:
@@ -86,44 +209,184 @@ def _max_upload_bytes() -> int:
         return 30 * 1024 * 1024
 
 
+def _row_cells(row: list) -> list[str]:
+    return [str(c or "").strip() for c in row]
+
+
+def _rows_equal_as_header(a: list[str], b: list[str]) -> bool:
+    if len(a) != len(b) or not a:
+        return False
+    return all(_norm_col(str(x)) == _norm_col(str(y)) for x, y in zip(a, b))
+
+
+def _table_fingerprint(tbl: list[list[str]]) -> tuple[str, ...]:
+    if not tbl:
+        return ()
+    head = tuple(_row_cells(tbl[0])[:8])
+    return (str(len(tbl)),) + head
+
+
+def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
+    """Try default + alternate table settings (many bank PDFs need non-default strategies)."""
+    tables: list[list[list[str]]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add_table(raw: list[list] | None) -> None:
+        if not raw or len(raw) < 2:
+            return
+        norm = [_row_cells(r) for r in raw]
+        fp = _table_fingerprint(norm)
+        if fp in seen:
+            return
+        seen.add(fp)
+        tables.append(norm)
+
+    add_table(page.extract_table())
+    settings_opts = (
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},
+        {"vertical_strategy": "lines", "horizontal_strategy": "text", "intersection_tolerance": 8},
+        {"vertical_strategy": "explicit", "horizontal_strategy": "explicit"},
+    )
+    for ts in settings_opts:
+        try:
+            for raw in page.extract_tables(table_settings=ts) or []:
+                add_table(raw)
+        except Exception:
+            continue
+    return tables
+
+
+def _merge_flat_rows_from_tables(page_tables: list[list[list[str]]]) -> list[list[str]]:
+    """Flatten tables into one row list; drop repeated header rows."""
+    flat: list[list[str]] = []
+    for tbl in page_tables:
+        for r in tbl:
+            flat.append(_row_cells(r))
+    if not flat:
+        return []
+    header = flat[0]
+    merged: list[list[str]] = [header]
+    norm_header = [_norm_col(str(c)) for c in header]
+    for r in flat[1:]:
+        if not any(c for c in r):
+            continue
+        if len(r) == len(header) and all(_norm_col(str(a)) == b for a, b in zip(r, norm_header)):
+            continue
+        merged.append(r)
+    return merged
+
+
 def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
-    """One pdfplumber pass: faster and roughly half the peak memory vs opening the PDF twice."""
+    """Extract tables with several pdfplumber strategies; single PDF open."""
     max_pages = _max_pdf_pages()
-    rows: list[list[str]] = []
+    all_rows: list[list[str]] = []
     text_chunks: list[str] = []
     with pdfplumber.open(io.BytesIO(content)) as pdf:
         total = len(pdf.pages)
         for page in pdf.pages[:max_pages]:
-            table = page.extract_table()
-            if table:
-                rows.extend(table)
             text_chunks.append(page.extract_text() or "")
-    if not rows:
+            page_tables = _extract_tables_from_pdf_page(page)
+            if not page_tables:
+                continue
+            best_tbl = max(page_tables, key=len)
+            chunk = _merge_flat_rows_from_tables([best_tbl])
+            if len(chunk) > 1:
+                if not all_rows:
+                    all_rows.extend(chunk)
+                else:
+                    h0 = all_rows[0]
+                    start = 1 if chunk and _rows_equal_as_header(chunk[0], h0) else 0
+                    all_rows.extend(chunk[start:])
+    if len(all_rows) < 2:
         hint = (
-            f"No table found in the first {max_pages} page(s) of this PDF."
+            f"No usable table in the first {max_pages} page(s). Tables may start later, or this may be a scanned/image PDF."
             if total > max_pages
-            else "Could not extract a table from this PDF."
+            else "No usable table found in this PDF. Scanned or image-only statements need OCR, or try CSV/Excel export from your bank."
         )
         raise HTTPException(
             status_code=400,
-            detail=f"{hint} Try exporting CSV from your bank, or set MAX_PDF_PAGES higher on the server.",
+            detail=f"{hint} You can set MAX_PDF_PAGES higher on the server or upload CSV/XLSX instead.",
         )
-    header = [str(h or "").strip() for h in rows[0]]
-    body = rows[1:]
+    header = all_rows[0]
+    body = all_rows[1:]
+    width = len(header)
+    body = [r + [""] * (width - len(r)) if len(r) < width else r[:width] for r in body]
     df = pd.DataFrame(body, columns=header)
     text = "\n".join(text_chunks).strip()
     return df, text
 
 
+def _normalize_loaded_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip().replace("\ufeff", "").strip() for c in out.columns]
+    out = out.dropna(axis=1, how="all")
+    return out
+
+
+def _read_csv_with_bad_lines(buf: io.StringIO, **kwargs: object) -> pd.DataFrame:
+    try:
+        return pd.read_csv(buf, on_bad_lines="skip", **kwargs)  # type: ignore[arg-type]
+    except TypeError:
+        buf.seek(0)
+        return pd.read_csv(buf, **kwargs)  # type: ignore[arg-type]
+
+
+def _read_csv_flexible(content: bytes) -> tuple[pd.DataFrame, str]:
+    text = ""
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            text = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text:
+        text = content.decode("utf-8", errors="replace")
+
+    last_err: str | None = None
+    for read_fn in (
+        lambda: _read_csv_with_bad_lines(io.StringIO(text), sep=None, engine="python"),
+        lambda: _read_csv_with_bad_lines(io.StringIO(text), sep=";"),
+        lambda: _read_csv_with_bad_lines(io.StringIO(text), sep=","),
+        lambda: _read_csv_with_bad_lines(io.StringIO(text), sep="\t"),
+    ):
+        try:
+            df = read_fn()
+            df = _normalize_loaded_frame(df)
+            if df.shape[1] >= 2:
+                return df, text
+        except Exception as e:  # pragma: no cover
+            last_err = str(e)
+            continue
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not parse CSV (need at least 2 columns). Try UTF-8 with comma or semicolon. ({last_err or 'unknown'})",
+    )
+
+
+def _read_excel_flexible(content: bytes) -> tuple[pd.DataFrame, str]:
+    last_err: str | None = None
+    for header_row in (0, 1, 2):
+        try:
+            df = pd.read_excel(io.BytesIO(content), header=header_row)
+            df = _normalize_loaded_frame(df)
+            if df.shape[1] >= 2 and df.shape[0] >= 1:
+                return df, df.to_csv(index=False)
+        except Exception as e:  # pragma: no cover
+            last_err = str(e)
+            continue
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not read Excel file. {last_err or 'Unknown error'}",
+    )
+
+
 def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix == ".csv":
-        text = content.decode("utf-8", errors="ignore")
-        df = pd.read_csv(io.StringIO(text))
-        return df, text
+        return _read_csv_flexible(content)
     if suffix in {".xlsx", ".xls"}:
-        df = pd.read_excel(io.BytesIO(content))
-        return df, df.to_csv(index=False)
+        return _read_excel_flexible(content)
     if suffix == ".pdf":
         return _load_pdf_tables_and_text(content)
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or Excel.")
@@ -133,10 +396,25 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     if df.empty:
         raise HTTPException(status_code=400, detail="Uploaded file has no rows.")
 
-    df = _canonicalise_columns(df.copy())
+    df = _normalize_loaded_frame(df.copy())
+    df = _canonicalise_columns(df)
+    inferred = _infer_date_column(df)
+    if inferred is not None:
+        df = inferred
     if "date" not in df.columns:
-        raise HTTPException(status_code=400, detail="No date column found in uploaded data.")
+        cols_preview = ", ".join(str(c) for c in list(df.columns)[:12])
+        if len(df.columns) > 12:
+            cols_preview += ", …"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No date column found in the uploaded document. "
+                f"Columns detected: {cols_preview}. "
+                "Rename a column to include 'Date' or export CSV with a clear date column."
+            ),
+        )
 
+    df = _infer_description_column(df)
     if "description" not in df.columns:
         df["description"] = ""
 
