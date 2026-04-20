@@ -10,7 +10,7 @@ import { getGreetingFirstName } from "@/lib/userProfile";
 
 const EMPTY_ANALYTICS: AnalyticsResponse = {
   sessionId: "",
-  currency: "EUR",
+  currency: "",
   summary: {
     totalIncome: 0,
     totalExpenses: 0,
@@ -43,10 +43,25 @@ export default function Dashboard() {
         setError(null);
       })
       .catch((err) => {
-        setError(err instanceof Error ? err.message : "Failed to load analytics.");
+        const message = err instanceof Error ? err.message : "Failed to load analytics.";
+        // Backend sessions are kept in memory, so a stored sessionId can become
+        // stale whenever the backend restarts. Silently clear it and stay in
+        // the empty state instead of surfacing a confusing "Session not found".
+        if (/session not found/i.test(message)) {
+          localStorage.removeItem("pocketwatch_session_id");
+          setAnalytics(EMPTY_ANALYTICS);
+          setError(null);
+        } else {
+          setError(message);
+        }
       })
       .finally(() => setLoading(false));
   }, []);
+
+  const handleUploaded = (data: AnalyticsResponse) => {
+    setAnalytics(data);
+    setError(null);
+  };
 
   return (
     <AppLayout>
@@ -56,7 +71,7 @@ export default function Dashboard() {
           <p className="text-muted-foreground text-sm">Here's your financial overview</p>
         </div>
 
-        <FileUpload onUploaded={setAnalytics} />
+        <FileUpload onUploaded={handleUploaded} />
         {error && <p className="text-sm text-destructive">{error}</p>}
         {loading && <p className="text-sm text-muted-foreground">Loading analytics...</p>}
         <SummaryCards summary={analytics.summary} currency={analytics.currency} />

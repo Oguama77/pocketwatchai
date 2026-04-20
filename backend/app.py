@@ -295,9 +295,17 @@ def _dedupe_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _max_pdf_pages() -> int:
     """Cap pages processed to avoid OOM / very long requests on small hosts (e.g. Render free tier)."""
     try:
-        return max(1, min(500, int(os.getenv("MAX_PDF_PAGES", "100"))))
+        return max(1, min(500, int(os.getenv("MAX_PDF_PAGES", "40"))))
     except ValueError:
-        return 100
+        return 40
+
+
+def _pdf_time_budget_seconds() -> float:
+    """Hard cap on total PDF table-extraction time. Prevents Render workers being killed for inactivity."""
+    try:
+        return max(5.0, min(120.0, float(os.getenv("PDF_TIME_BUDGET_SECONDS", "55"))))
+    except ValueError:
+        return 55.0
 
 
 def _max_upload_bytes() -> int:
@@ -325,21 +333,31 @@ def _table_fingerprint(tbl: list[list[str]]) -> tuple[str, ...]:
 
 
 def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
-    """Try default + alternate table settings (many bank PDFs need non-default strategies)."""
+    """Try default + alternate table settings (many bank PDFs need non-default strategies).
+
+    Early-exit as soon as we have a table that's plausibly a transaction list (>= 3 data rows).
+    Running every strategy on every page is what kills small hosts (OOM / 100s timeout on Render).
+    """
     tables: list[list[list[str]]] = []
     seen: set[tuple[str, ...]] = set()
 
-    def add_table(raw: list[list] | None) -> None:
+    def add_table(raw: list[list] | None) -> bool:
         if not raw or len(raw) < 2:
-            return
+            return False
         norm = [_row_cells(r) for r in raw]
         fp = _table_fingerprint(norm)
         if fp in seen:
-            return
+            return False
         seen.add(fp)
         tables.append(norm)
+        return len(norm) >= 4
 
-    add_table(page.extract_table())
+    try:
+        if add_table(page.extract_table()):
+            return tables
+    except Exception:
+        pass
+
     settings_opts = (
         {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
         {"vertical_strategy": "text", "horizontal_strategy": "text"},
@@ -348,10 +366,15 @@ def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
     )
     for ts in settings_opts:
         try:
-            for raw in page.extract_tables(table_settings=ts) or []:
-                add_table(raw)
+            raws = page.extract_tables(table_settings=ts) or []
         except Exception:
             continue
+        good = False
+        for raw in raws:
+            if add_table(raw):
+                good = True
+        if good:
+            break
     return tables
 
 
@@ -376,15 +399,45 @@ def _merge_flat_rows_from_tables(page_tables: list[list[list[str]]]) -> list[lis
 
 
 def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
-    """Extract tables with several pdfplumber strategies; single PDF open."""
+    """Extract tables with several pdfplumber strategies; single PDF open.
+
+    Defensive against:
+      * per-page exceptions (skip page, continue),
+      * total time budget (bail out cleanly with a useful error),
+      * very large PDFs (page cap + early-exit strategies).
+    """
+    import time as _time
+
     max_pages = _max_pdf_pages()
+    time_budget = _pdf_time_budget_seconds()
+    started = _time.monotonic()
+
     all_rows: list[list[str]] = []
     text_chunks: list[str] = []
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
+    pages_processed = 0
+    timed_out = False
+    try:
+        pdf_ctx = pdfplumber.open(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not open PDF (file may be corrupted or password-protected): {e}",
+        )
+    with pdf_ctx as pdf:
         total = len(pdf.pages)
         for page in pdf.pages[:max_pages]:
-            text_chunks.append(page.extract_text() or "")
-            page_tables = _extract_tables_from_pdf_page(page)
+            if _time.monotonic() - started > time_budget:
+                timed_out = True
+                break
+            try:
+                text_chunks.append(page.extract_text() or "")
+            except Exception:
+                text_chunks.append("")
+            try:
+                page_tables = _extract_tables_from_pdf_page(page)
+            except Exception:
+                page_tables = []
+            pages_processed += 1
             if not page_tables:
                 continue
             best_tbl = max(page_tables, key=len)
@@ -397,11 +450,19 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
                     start = 1 if chunk and _rows_equal_as_header(chunk[0], h0) else 0
                     all_rows.extend(chunk[start:])
     if len(all_rows) < 2:
-        hint = (
-            f"No usable table in the first {max_pages} page(s). Tables may start later, or this may be a scanned/image PDF."
-            if total > max_pages
-            else "No usable table found in this PDF. Scanned or image-only statements need OCR, or try CSV/Excel export from your bank."
-        )
+        if timed_out:
+            hint = (
+                f"PDF processing exceeded the {int(time_budget)}s time budget after {pages_processed} page(s). "
+                "This usually means the file is large/scanned or the host is too small. "
+                "Try a CSV/XLSX export from your bank, split the PDF into smaller files, "
+                "or increase PDF_TIME_BUDGET_SECONDS / MAX_PDF_PAGES on the server."
+            )
+        else:
+            hint = (
+                f"No usable table in the first {max_pages} page(s). Tables may start later, or this may be a scanned/image PDF."
+                if total > max_pages
+                else "No usable table found in this PDF. Scanned or image-only statements need OCR, or try CSV/Excel export from your bank."
+            )
         raise HTTPException(
             status_code=400,
             detail=f"{hint} You can set MAX_PDF_PAGES higher on the server or upload CSV/XLSX instead.",
@@ -550,6 +611,92 @@ def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or Excel.")
 
 
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR",
+    "₩": "KRW",
+    "₽": "RUB",
+    "₺": "TRY",
+    "₪": "ILS",
+    "₦": "NGN",
+    "₴": "UAH",
+    "฿": "THB",
+}
+
+CURRENCY_DOLLAR_PREFIX: dict[str, str] = {
+    "CA$": "CAD",
+    "C$": "CAD",
+    "AU$": "AUD",
+    "A$": "AUD",
+    "NZ$": "NZD",
+    "HK$": "HKD",
+    "SG$": "SGD",
+    "S$": "SGD",
+    "R$": "BRL",
+    "MX$": "MXN",
+    "NT$": "TWD",
+    "US$": "USD",
+}
+
+CURRENCY_CODE_RE = re.compile(
+    r"\b(EUR|USD|GBP|JPY|INR|CHF|CAD|AUD|NZD|SEK|NOK|DKK|ZAR|HKD|SGD|CNY|RMB|"
+    r"KRW|BRL|MXN|RUB|PLN|TRY|ILS|AED|SAR|QAR|CZK|HUF|RON|IDR|THB|MYR|PHP|VND|"
+    r"PKR|BDT|NGN|KES|GHS|EGP|MAD|TWD|UAH|ARS|COP|CLP|PEN|ISK|BGN|HRK)\b"
+)
+
+
+def _detect_currency(source_text: str, df: pd.DataFrame | None) -> str:
+    """Best-effort currency detection from PDF text, column headers, and cell values.
+
+    Returns an empty string when no currency evidence is found, so the frontend
+    can render totals without a misleading default (e.g. EUR)."""
+    samples: list[str] = []
+    if source_text:
+        samples.append(source_text[:20000])
+    if df is not None:
+        samples.extend(str(c) for c in df.columns)
+        for col in df.columns:
+            try:
+                samples.extend(df[col].dropna().astype(str).head(50).tolist())
+            except Exception:
+                continue
+    blob = " ".join(samples)
+    if not blob.strip():
+        return ""
+
+    counts: dict[str, int] = {}
+
+    for prefix, code in CURRENCY_DOLLAR_PREFIX.items():
+        n = blob.count(prefix)
+        if n:
+            counts[code] = counts.get(code, 0) + n * 3
+
+    for m in CURRENCY_CODE_RE.finditer(blob):
+        code = m.group(1)
+        if code == "RMB":
+            code = "CNY"
+        counts[code] = counts.get(code, 0) + 2
+
+    for sym, code in CURRENCY_SYMBOLS.items():
+        n = blob.count(sym)
+        if n:
+            counts[code] = counts.get(code, 0) + n
+
+    dollar_count = blob.count("$")
+    prefixed_dollars = sum(blob.count(p) for p in CURRENCY_DOLLAR_PREFIX)
+    bare_dollars = dollar_count - prefixed_dollars
+    if bare_dollars > 0 and "USD" not in counts and not any(
+        counts.get(c, 0) >= 3 for c in ("CAD", "AUD", "NZD", "HKD", "SGD")
+    ):
+        counts["USD"] = counts.get("USD", 0) + bare_dollars
+
+    if not counts:
+        return ""
+    return max(counts, key=lambda k: counts[k])
+
+
 def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     if df.empty:
         raise HTTPException(status_code=400, detail="Uploaded file has no rows.")
@@ -613,7 +760,7 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     df["expense"] = pd.to_numeric(expense, errors="coerce").fillna(0)
     df["income"] = pd.to_numeric(income, errors="coerce").fillna(0)
     df["description"] = df["description"].astype(str).fillna("")
-    return df, "EUR"
+    return df, ""
 
 
 def _merchant_like_key(text: str) -> str:
@@ -991,16 +1138,49 @@ def health_alias() -> dict[str, str]:
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)) -> dict:
-    content = await file.read()
+    try:
+        content = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read uploaded file: {e}")
+
     max_bytes = _max_upload_bytes()
     if len(content) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large ({len(content)} bytes). Maximum is {max_bytes} bytes.",
+            detail=(
+                f"File too large ({len(content):,} bytes). Maximum is {max_bytes:,} bytes. "
+                "Try a CSV/XLSX export from your bank, or split the PDF."
+            ),
         )
-    df_raw, source_text = _load_dataframe(file, content)
-    df, currency = _prepare_financial_df(df_raw)
-    analytics = _build_analytics(df, currency)
+
+    try:
+        df_raw, source_text = _load_dataframe(file, content)
+        detected_currency = _detect_currency(source_text, df_raw)
+        df, _ = _prepare_financial_df(df_raw)
+        currency = detected_currency
+        analytics = _build_analytics(df, currency)
+    except HTTPException:
+        raise
+    except MemoryError:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Server ran out of memory while parsing this file. "
+                "Try a CSV/XLSX export, split the PDF into smaller files, or upgrade the host instance."
+            ),
+        )
+    except Exception as e:
+        import traceback
+        print("[/api/upload] unexpected error:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Server error while processing the file: {type(e).__name__}: {e}. "
+                "Try a CSV/XLSX export from your bank, or a smaller PDF."
+            ),
+        )
+
     session_id = str(uuid.uuid4())
     SESSIONS[session_id] = SessionData(frame=df, source_text=source_text, currency=currency, analytics=analytics)
     return {"sessionId": session_id, **analytics}

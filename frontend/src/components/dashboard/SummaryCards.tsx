@@ -8,24 +8,28 @@ interface SummaryCardsProps {
 }
 
 export function SummaryCards({ summary, currency }: SummaryCardsProps) {
+  const prefix = currency ? `${currency} ` : "";
+  const format = (n: number) =>
+    `${prefix}${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+
   const cards = [
     {
       title: "Total Income",
-      value: `${currency} ${summary.totalIncome.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+      value: format(summary.totalIncome),
       change: `${summary.incomeChangePct >= 0 ? "+" : ""}${summary.incomeChangePct.toFixed(1)}%`,
       positive: summary.incomeChangePct >= 0,
       icon: TrendingUp,
     },
     {
       title: "Total Expenses",
-      value: `${currency} ${summary.totalExpenses.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+      value: format(summary.totalExpenses),
       change: `${summary.expenseChangePct >= 0 ? "+" : ""}${summary.expenseChangePct.toFixed(1)}%`,
       positive: summary.expenseChangePct <= 0,
       icon: TrendingDown,
     },
     {
       title: "Net Balance",
-      value: `${currency} ${summary.netBalance.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+      value: format(summary.netBalance),
       change: `${summary.netBalanceChangePct >= 0 ? "+" : ""}${summary.netBalanceChangePct.toFixed(1)}%`,
       positive: summary.netBalanceChangePct >= 0,
       icon: Wallet,
