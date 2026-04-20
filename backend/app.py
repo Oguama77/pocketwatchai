@@ -332,50 +332,295 @@ def _table_fingerprint(tbl: list[list[str]]) -> tuple[str, ...]:
     return (str(len(tbl)),) + head
 
 
-def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
-    """Try default + alternate table settings (many bank PDFs need non-default strategies).
+_HEADER_KEYWORDS: set[str] = {
+    "date", "transaction", "trans", "transdate", "valuedate", "bookingdate",
+    "postdate", "postingdate", "txn",
+    "description", "details", "narrative", "memo", "reference", "particulars",
+    "debit", "credit", "amount", "money", "balance", "withdrawal", "deposit",
+    "in", "out", "payee",
+}
 
-    Early-exit as soon as we have a table that's plausibly a transaction list (>= 3 data rows).
-    Running every strategy on every page is what kills small hosts (OOM / 100s timeout on Render).
+_MONTH_PATTERN = (
+    r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec|"
+    r"January|February|March|April|June|July|August|September|October|November|December"
+)
+
+_DATE_LINE_RE = re.compile(
+    r"^\s*(?:"
+    rf"(?:{_MONTH_PATTERN})\s+\d{{1,2}},?\s+\d{{2,4}}|"
+    rf"\d{{1,2}}[\s\-/\.](?:{_MONTH_PATTERN})[\s\-/\.]\d{{2,4}}|"
+    r"\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}|"
+    r"\d{4}[\-/\.]\d{1,2}[\-/\.]\d{1,2}"
+    r")\b",
+    re.I,
+)
+
+
+def _is_date_header_token(token: str) -> bool:
+    return token == "date" or token.endswith("date") or token.startswith("date")
+
+
+def _group_words_by_line(words: list[dict], y_tol: float = 2.5) -> list[list[dict]]:
+    """Cluster pdfplumber words into visual lines based on their 'top' coordinate."""
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: list[list[dict]] = [[ws[0]]]
+    for w in ws[1:]:
+        if abs(w["top"] - lines[-1][-1]["top"]) <= y_tol:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    for line in lines:
+        line.sort(key=lambda x: x["x0"])
+    return lines
+
+
+def _score_header_candidate_line(line_words: list[dict]) -> int:
+    """Score how likely a line of words is the transaction table's header row."""
+    if len(line_words) < 3:
+        return 0
+    toks = [re.sub(r"[^a-z]", "", str(w["text"]).lower()) for w in line_words]
+    if not any(_is_date_header_token(t) for t in toks if t):
+        return 0
+    hits = sum(1 for t in toks if t in _HEADER_KEYWORDS)
+    if hits < 3:
+        return 0
+    amount_like = sum(
+        1 for t in toks
+        if t in {"amount", "debit", "credit", "balance", "withdrawal", "deposit", "money"}
+    )
+    return hits + amount_like
+
+
+def _pick_column_gap_threshold(gaps: list[float]) -> float:
+    """Find the jump between intra-column and inter-column word gaps.
+
+    Sort gaps ascending; the biggest *ratio* between consecutive values marks
+    the boundary. If the distribution is uniform (no clear jump), fall back to
+    a fixed 15pt threshold, which empirically separates columns on most bank
+    statements without merging multi-word header cells like "Money out"."""
+    if not gaps:
+        return float("inf")
+    sorted_g = sorted(gaps)
+    if len(sorted_g) == 1:
+        return sorted_g[0] + 1.0
+    best_ratio = 1.0
+    threshold = sorted_g[-1] + 1.0
+    for i in range(1, len(sorted_g)):
+        prev = max(sorted_g[i - 1], 0.5)
+        ratio = sorted_g[i] / prev
+        if ratio > best_ratio:
+            best_ratio = ratio
+            threshold = (sorted_g[i - 1] + sorted_g[i]) / 2
+    if best_ratio < 1.8:
+        return 15.0
+    return max(threshold, 6.0)
+
+
+def _infer_columns_from_header_words(header_words: list[dict]) -> list[tuple[str, float, float]]:
+    """Group adjacent header words into column cells using a dynamic x-gap threshold."""
+    if not header_words:
+        return []
+    gaps = [header_words[i]["x0"] - header_words[i - 1]["x1"] for i in range(1, len(header_words))]
+    threshold = _pick_column_gap_threshold(gaps)
+    groups: list[list[dict]] = [[header_words[0]]]
+    for i, gap in enumerate(gaps, start=1):
+        if gap >= threshold:
+            groups.append([header_words[i]])
+        else:
+            groups[-1].append(header_words[i])
+    return [(" ".join(w["text"] for w in g), g[0]["x0"], g[-1]["x1"]) for g in groups]
+
+
+def _assign_word_to_column(word: dict, columns: list[tuple[str, float, float]]) -> int:
+    """Pick the column whose x-range overlaps the word most; fall back to the rightmost
+    column whose x-start lies at or before the word (natural reading order)."""
+    x0, x1 = word["x0"], word["x1"]
+    best_col = -1
+    best_overlap = 0.0
+    for i, (_, xs, xe) in enumerate(columns):
+        overlap = max(0.0, min(x1, xe) - max(x0, xs))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_col = i
+    if best_col >= 0:
+        return best_col
+    center = (x0 + x1) / 2
+    picked = 0
+    for i, (_, xs, _) in enumerate(columns):
+        if xs <= center + 4:
+            picked = i
+    return picked
+
+
+def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
+    """Reconstruct a transaction table from word x-coordinates.
+
+    Works for PDFs where pdfplumber's ruled-table extraction fails or mangles
+    rows (Revolut has no table rules at all; FirstBank has rules but rows are
+    collapsed into a single cell). Steps:
+      1. Group words into visual lines.
+      2. Detect the header line (must mention a 'date' column + >=3 known terms).
+      3. Derive column x-ranges from header word clusters.
+      4. For every subsequent line, assign words to columns by x-overlap; a new
+         transaction begins when the date column matches a date pattern,
+         otherwise the line is a continuation of the current transaction.
     """
-    tables: list[list[list[str]]] = []
+    try:
+        words = page.extract_words(use_text_flow=False)
+    except Exception:
+        return None
+    if not words:
+        return None
+
+    lines = _group_words_by_line(words, y_tol=2.5)
+    header_idx = -1
+    best_score = 0
+    for i, line in enumerate(lines):
+        s = _score_header_candidate_line(line)
+        if s > best_score:
+            best_score = s
+            header_idx = i
+    if header_idx < 0:
+        return None
+
+    columns = _infer_columns_from_header_words(lines[header_idx])
+    if len(columns) < 2:
+        return None
+
+    date_col_idx = 0
+    for i, (lbl, _, _) in enumerate(columns):
+        norm = re.sub(r"[^a-z]", "", lbl.lower())
+        if _is_date_header_token(norm):
+            date_col_idx = i
+            break
+    else:
+        for i, (lbl, _, _) in enumerate(columns):
+            if "date" in lbl.lower():
+                date_col_idx = i
+                break
+
+    rows: list[list[str]] = []
+    current: list[list[str]] | None = None
+    for line in lines[header_idx + 1:]:
+        cell_tokens: list[list[str]] = [[] for _ in columns]
+        for w in line:
+            col = _assign_word_to_column(w, columns)
+            cell_tokens[col].append(w["text"])
+        cells = [" ".join(tokens).strip() for tokens in cell_tokens]
+
+        date_cell = cells[date_col_idx] if date_col_idx < len(cells) else ""
+        if date_cell and _DATE_LINE_RE.match(date_cell):
+            if current is not None:
+                rows.append([" ".join(c).strip() for c in current])
+            current = [[cells[j]] if cells[j] else [] for j in range(len(columns))]
+        elif current is not None:
+            for j in range(len(columns)):
+                if cells[j]:
+                    current[j].append(cells[j])
+
+    if current is not None:
+        rows.append([" ".join(c).strip() for c in current])
+    if not rows:
+        return None
+    header_labels = [c[0] for c in columns]
+    return [header_labels] + rows
+
+
+def _table_quality_score(tbl: list[list[str]]) -> float:
+    """Rank a candidate table by how much it looks like a usable transaction list.
+
+    Hard gates:
+      * header must contain a 'date' column, and
+      * header must contain at least 2 transaction-related terms, and
+      * at least 3 distinct columns must be populated in the body.
+    Tables failing any gate score 0, which eliminates pdfplumber's
+    text-strategy output from random PDF prose (e.g. address block at the top
+    of a Revolut statement) that otherwise wins on raw row count."""
+    if not tbl or len(tbl) < 2:
+        return 0.0
+    header = tbl[0]
+    body = tbl[1:]
+    width = max(len(r) for r in tbl)
+    if width < 2:
+        return 0.0
+
+    col_fill = [0] * width
+    for r in body:
+        for i, c in enumerate(r[:width]):
+            if c is not None and str(c).strip():
+                col_fill[i] += 1
+    populated_cols = sum(1 for c in col_fill if c > 0)
+    if populated_cols < 3:
+        return 0.0
+
+    hdr_norm = [_norm_col(str(c)) for c in header]
+    transaction_terms = (
+        "date", "description", "details", "narrative",
+        "amount", "debit", "credit", "balance",
+        "withdrawal", "deposit", "money",
+    )
+    hdr_hits = sum(
+        1 for c in hdr_norm
+        if c and any(tok in c for tok in transaction_terms)
+    )
+    if hdr_hits < 2:
+        return 0.0
+    has_date_header = any(c and "date" in c for c in hdr_norm)
+    if not has_date_header:
+        return 0.0
+
+    body_rows = min(len(body), 300)
+    return populated_cols * 5 + body_rows + hdr_hits * 40
+
+
+def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
+    """Return the single best transaction-like table for a page (list-wrapped).
+
+    Runs a word-position reconstructor plus several pdfplumber strategies and
+    picks the highest-scoring candidate. This generalises across statements
+    that extract cleanly with ruled tables (e.g. FirstBank) and ones with no
+    table lines at all (e.g. Revolut)."""
+    candidates: list[list[list[str]]] = []
     seen: set[tuple[str, ...]] = set()
 
-    def add_table(raw: list[list] | None) -> bool:
+    def add_candidate(raw: list[list] | None) -> None:
         if not raw or len(raw) < 2:
-            return False
+            return
         norm = [_row_cells(r) for r in raw]
         fp = _table_fingerprint(norm)
         if fp in seen:
-            return False
+            return
         seen.add(fp)
-        tables.append(norm)
-        return len(norm) >= 4
+        candidates.append(norm)
 
     try:
-        if add_table(page.extract_table()):
-            return tables
+        wp = _extract_transactions_by_word_positions(page)
     except Exception:
-        pass
+        wp = None
+    if wp:
+        add_candidate(wp)
 
-    settings_opts = (
+    strategies: tuple[dict | None, ...] = (
+        None,
+        {"vertical_strategy": "text", "horizontal_strategy": "lines"},
         {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
-        {"vertical_strategy": "text", "horizontal_strategy": "text"},
         {"vertical_strategy": "lines", "horizontal_strategy": "text", "intersection_tolerance": 8},
-        {"vertical_strategy": "explicit", "horizontal_strategy": "explicit"},
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},
     )
-    for ts in settings_opts:
+    for ts in strategies:
         try:
-            raws = page.extract_tables(table_settings=ts) or []
+            raws = page.extract_tables(table_settings=ts) if ts else page.extract_tables()
         except Exception:
             continue
-        good = False
-        for raw in raws:
-            if add_table(raw):
-                good = True
-        if good:
-            break
-    return tables
+        for raw in (raws or []):
+            add_candidate(raw)
+
+    if not candidates:
+        return []
+    best = max(candidates, key=_table_quality_score)
+    return [best] if _table_quality_score(best) > 0 else []
 
 
 def _merge_flat_rows_from_tables(page_tables: list[list[list[str]]]) -> list[list[str]]:
@@ -415,6 +660,7 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
     all_rows: list[list[str]] = []
     text_chunks: list[str] = []
     pages_processed = 0
+    pages_with_text = 0
     timed_out = False
     try:
         pdf_ctx = pdfplumber.open(io.BytesIO(content))
@@ -430,14 +676,21 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
                 timed_out = True
                 break
             try:
-                text_chunks.append(page.extract_text() or "")
+                page_text = page.extract_text() or ""
             except Exception:
-                text_chunks.append("")
+                page_text = ""
+            text_chunks.append(page_text)
+            pages_processed += 1
+            # Skip image-only (scanned) pages fast: running every table strategy
+            # on 28 blank pages costs ~3 minutes and never yields a table.
+            has_chars = bool(getattr(page, "chars", None))
+            if not page_text.strip() and not has_chars:
+                continue
+            pages_with_text += 1
             try:
                 page_tables = _extract_tables_from_pdf_page(page)
             except Exception:
                 page_tables = []
-            pages_processed += 1
             if not page_tables:
                 continue
             best_tbl = max(page_tables, key=len)
@@ -450,7 +703,13 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
                     start = 1 if chunk and _rows_equal_as_header(chunk[0], h0) else 0
                     all_rows.extend(chunk[start:])
     if len(all_rows) < 2:
-        if timed_out:
+        if pages_processed > 0 and pages_with_text == 0:
+            hint = (
+                f"This PDF looks scanned/image-only ({pages_processed} page(s) processed, 0 with extractable text). "
+                "Re-export the statement as a text PDF, CSV, or Excel file from your bank — "
+                "OCR is required to read scanned images and is not enabled on this server."
+            )
+        elif timed_out:
             hint = (
                 f"PDF processing exceeded the {int(time_budget)}s time budget after {pages_processed} page(s). "
                 "This usually means the file is large/scanned or the host is too small. "
