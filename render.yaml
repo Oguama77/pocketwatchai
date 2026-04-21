@@ -21,10 +21,11 @@ services:
         value: /usr/bin/tesseract
       - key: TESSERACT_LANG
         value: eng
-      # Render Starter has ~512 MB RAM; 300 DPI OCR on 10+ pages can peak high.
-      # Drop to 200 here if you see OOMs in logs.
+      # Render Starter has ~512 MB RAM. Default is 200 DPI which keeps peak
+      # RSS around 250 MB even on 28-page scanned statements. Raise to 250/300
+      # only if you are on a larger plan AND digit accuracy is too low.
       - key: OCR_DPI
-        value: "250"
+        value: "200"
       # Optional safety caps (unset = no limit). Keep unset to process long PDFs.
       # - key: MAX_PDF_PAGES
       #   value: "200"

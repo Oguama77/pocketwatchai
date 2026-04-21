@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Upload, Volume2 } from "lucide-react";
+import { Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/store/useAppStore";
@@ -99,19 +99,13 @@ export function ChatInterface() {
             >
               <div
                 className={cn(
-                  "max-w-[75%] px-4 py-3 rounded-2xl text-sm leading-relaxed",
+                  "max-w-[75%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap",
                   msg.role === "user"
                     ? "chat-bubble-user rounded-br-md"
                     : "chat-bubble-ai rounded-bl-md"
                 )}
               >
                 {msg.content}
-                {msg.role === "assistant" && (
-                  <button className="mt-2 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors">
-                    <Volume2 className="h-3 w-3" />
-                    Listen
-                  </button>
-                )}
               </div>
             </div>
           ))}
@@ -133,14 +127,15 @@ export function ChatInterface() {
       {/* Input */}
       <div className="border-t border-border p-4 bg-background">
         <div className="max-w-3xl mx-auto flex items-center gap-2">
-          <Button variant="ghost" size="icon" className="shrink-0 h-9 w-9">
-            <Upload className="h-4 w-4" />
-          </Button>
           <div className="flex-1 relative">
             <input
               type="text"
               className="w-full px-4 py-2.5 rounded-xl border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20 transition-all"
-              placeholder="Ask about your finances..."
+              placeholder={
+                hasUploadedSession
+                  ? "Ask about your uploaded statement or any finance topic..."
+                  : "Ask about your finances..."
+              }
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}

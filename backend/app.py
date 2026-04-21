@@ -641,61 +641,85 @@ def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
 
 
 def _preprocess_for_ocr(img):
-    """Boost OCR accuracy on scanned statements.
+    """Boost OCR accuracy on scanned statements with minimal peak memory.
 
-    Converts to grayscale, auto-levels contrast, and applies a local threshold
-    that keeps thin digits / decimal points readable while removing scan noise.
-    Typically doubles digit accuracy on greyscale bank scans and makes
-    Tesseract run faster (less noise to segment)."""
+    The input is already 'L' (grayscale) mode — we render that way directly
+    from pypdfium2. We apply autocontrast + median denoise + threshold in
+    place, reusing buffers so at most one full-resolution image exists in RAM
+    at a time. This matters on small hosts (e.g. 512 MB Render Starter) where
+    a 300 DPI A4 page is ~8.5M pixels — holding 3 copies briefly is enough to
+    OOM on a 28-page scan like a UBA statement."""
     try:
         from PIL import ImageOps, ImageFilter
     except Exception:
         return img
     try:
-        gray = img.convert("L")
+        gray = img if img.mode == "L" else img.convert("L")
+        if gray is not img:
+            img.close()
         gray = ImageOps.autocontrast(gray, cutoff=1)
         gray = gray.filter(ImageFilter.MedianFilter(size=3))
-        # Simple global threshold — fast and good enough for high-DPI bank scans.
         bw = gray.point(lambda p: 255 if p > 180 else 0, mode="1")
+        gray.close()
         return bw
     except Exception:
         return img
 
 
-def _ocr_page_words(pdf_bytes: bytes, page_idx: int, dpi: int | None = None) -> list[dict] | None:
-    """OCR a single PDF page and return words in pdfplumber-style dicts.
+def _get_ocr_dpi() -> int:
+    try:
+        return max(120, min(600, int(os.getenv("OCR_DPI", "200"))))
+    except ValueError:
+        return 200
 
-    Coordinates are returned in typographic points (72 dpi) so the downstream
-    word-position parser — tuned for pdfplumber word boxes — works unchanged.
 
-    `dpi` defaults to the OCR_DPI env var (or 300). Drop to 200 for ~2x speed
-    at a small accuracy cost."""
+def _ocr_page_words_from_doc(pdf_doc, page_idx: int, dpi: int | None = None) -> list[dict] | None:
+    """OCR a single page of an already-open pypdfium2 PdfDocument.
+
+    Factored out so the caller can open the document once for the whole file
+    instead of reparsing it per page (the old code did N full parses). Returns
+    words in pdfplumber-style dicts in typographic points (72 dpi), so the
+    word-position parser works unchanged.
+
+    Careful with memory: we render at `force_bitmap_format=GRAY` to avoid an
+    intermediate RGBA bitmap (4x smaller), and we explicitly close bitmaps
+    and images as soon as possible."""
     if pytesseract is None or pdfium is None:
         return None
     if dpi is None:
-        try:
-            dpi = max(120, min(600, int(os.getenv("OCR_DPI", "300"))))
-        except ValueError:
-            dpi = 300
-    try:
-        pdf_doc = pdfium.PdfDocument(pdf_bytes)
-    except Exception:
-        return None
+        dpi = _get_ocr_dpi()
     try:
         if page_idx >= len(pdf_doc):
             return None
         page = pdf_doc[page_idx]
-        scale = dpi / 72.0
+    except Exception:
+        return None
+
+    scale = dpi / 72.0
+    img = None
+    bitmap = None
+    try:
         try:
-            bitmap = page.render(scale=scale)
+            try:
+                bitmap = page.render(
+                    scale=scale,
+                    grayscale=True,
+                )
+            except TypeError:
+                # Older pypdfium2 API: no `grayscale` kwarg.
+                bitmap = page.render(scale=scale)
             img = bitmap.to_pil()
         except Exception:
             return None
+        finally:
+            if bitmap is not None:
+                try:
+                    bitmap.close()
+                except Exception:
+                    pass
+                bitmap = None
+
         img = _preprocess_for_ocr(img)
-        # --psm 6 = "assume a single uniform block of text", which is the correct
-        # mental model for a bank-statement page (rows of transactions).
-        # -c preserve_interword_spaces=1 keeps the column gaps intact so the
-        # word-position parser can infer column boundaries.
         tesseract_config = os.getenv(
             "TESSERACT_CONFIG",
             "--oem 1 --psm 6 -c preserve_interword_spaces=1",
@@ -712,8 +736,13 @@ def _ocr_page_words(pdf_bytes: bytes, page_idx: int, dpi: int | None = None) -> 
         except Exception:
             return None
     finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
         try:
-            pdf_doc.close()
+            page.close()
         except Exception:
             pass
 
@@ -744,6 +773,24 @@ def _ocr_page_words(pdf_bytes: bytes, page_idx: int, dpi: int | None = None) -> 
             "bottom": top + height,
         })
     return words or None
+
+
+def _ocr_page_words(pdf_bytes: bytes, page_idx: int, dpi: int | None = None) -> list[dict] | None:
+    """Convenience wrapper: open the PDF for a single page. Prefer using
+    `_ocr_page_words_from_doc` directly when OCR'ing many pages in a row."""
+    if pytesseract is None or pdfium is None:
+        return None
+    try:
+        pdf_doc = pdfium.PdfDocument(pdf_bytes)
+    except Exception:
+        return None
+    try:
+        return _ocr_page_words_from_doc(pdf_doc, page_idx, dpi=dpi)
+    finally:
+        try:
+            pdf_doc.close()
+        except Exception:
+            pass
 
 
 def _ocr_page_text(words: list[dict] | None) -> str:
@@ -883,6 +930,7 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
     or scanned statements are processed fully. MAX_PDF_PAGES and
     PDF_TIME_BUDGET_SECONDS env vars still work as optional safety limits."""
     import time as _time
+    import gc as _gc
 
     max_pages = _max_pdf_pages()
     time_budget = _pdf_time_budget_seconds()
@@ -904,76 +952,99 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
             status_code=400,
             detail=f"Could not open PDF (file may be corrupted or password-protected): {e}",
         )
-    with pdf_ctx as pdf:
-        total = len(pdf.pages)
-        for page_idx, page in enumerate(pdf.pages[:max_pages]):
-            if _time.monotonic() - started > time_budget:
-                timed_out = True
-                break
-            try:
-                page_text = page.extract_text() or ""
-            except Exception:
-                page_text = ""
-            has_chars = bool(getattr(page, "chars", None))
-            pages_processed += 1
 
-            chunk: list[list[str]] = []
-            if page_text.strip() or has_chars:
-                pages_with_text += 1
-                text_chunks.append(page_text)
+    # Open the pypdfium2 document lazily — only if / when we hit an OCR page.
+    # Opening it once here and reusing it across every page avoids re-parsing
+    # the PDF N times (the old code did that inside _ocr_page_words).
+    pdfium_doc = None
+
+    try:
+        with pdf_ctx as pdf:
+            total = len(pdf.pages)
+            for page_idx, page in enumerate(pdf.pages[:max_pages]):
+                if _time.monotonic() - started > time_budget:
+                    timed_out = True
+                    break
                 try:
-                    page_tables = _extract_tables_from_pdf_page(page)
+                    page_text = page.extract_text() or ""
                 except Exception:
-                    page_tables = []
-                if page_tables:
-                    best_tbl = max(page_tables, key=len)
-                    chunk = _merge_flat_rows_from_tables([best_tbl])
-            else:
-                # Image-only page → OCR.
-                if not ocr_attempted:
-                    ocr_attempted = True
-                    ocr_ready = _ocr_available()
-                    print(
-                        f"[pdf] page {page_idx + 1}/{total} has no text; "
-                        f"OCR available={ocr_ready} "
-                        f"(tesseract={pytesseract.pytesseract.tesseract_cmd if pytesseract else 'missing'})"
-                    )
-                if not ocr_ready:
-                    text_chunks.append("")
-                    continue
-                page_started = _time.monotonic()
-                try:
-                    words = _ocr_page_words(content, page_idx)
-                except Exception as ocr_err:
-                    if pytesseract is not None and isinstance(
-                        ocr_err, pytesseract.TesseractNotFoundError
-                    ):
-                        tesseract_missing = True
-                        ocr_ready = False
-                    words = None
-                page_elapsed = _time.monotonic() - page_started
-                if words:
-                    pages_ocred += 1
-                    text_chunks.append(_ocr_page_text(words))
-                    reconstructed = _extract_transactions_from_words(words, y_tol=4.0)
-                    if reconstructed and len(reconstructed) >= 2:
-                        chunk = _merge_flat_rows_from_tables([reconstructed])
-                    print(
-                        f"[pdf] ocr page {page_idx + 1}: {len(words)} words, "
-                        f"table_rows={len(reconstructed) if reconstructed else 0}, "
-                        f"{page_elapsed:.1f}s"
-                    )
-                else:
-                    text_chunks.append("")
-                    print(f"[pdf] ocr page {page_idx + 1}: no words recognised ({page_elapsed:.1f}s)")
+                    page_text = ""
+                has_chars = bool(getattr(page, "chars", None))
+                pages_processed += 1
 
-            if len(chunk) > 1:
-                if not all_rows:
-                    all_rows.extend(chunk)
+                chunk: list[list[str]] = []
+                if page_text.strip() or has_chars:
+                    pages_with_text += 1
+                    text_chunks.append(page_text)
+                    try:
+                        page_tables = _extract_tables_from_pdf_page(page)
+                    except Exception:
+                        page_tables = []
+                    if page_tables:
+                        best_tbl = max(page_tables, key=len)
+                        chunk = _merge_flat_rows_from_tables([best_tbl])
                 else:
-                    h0 = all_rows[0]
-                    start_row = 1 if _rows_equal_as_header(chunk[0], h0) else 0
-                    all_rows.extend(chunk[start_row:])
+                    # Image-only page → OCR.
+                    if not ocr_attempted:
+                        ocr_attempted = True
+                        ocr_ready = _ocr_available()
+                        print(
+                            f"[pdf] page {page_idx + 1}/{total} has no text; "
+                            f"OCR available={ocr_ready} "
+                            f"dpi={_get_ocr_dpi()} "
+                            f"(tesseract={pytesseract.pytesseract.tesseract_cmd if pytesseract else 'missing'})"
+                        )
+                        if ocr_ready and pdfium_doc is None:
+                            try:
+                                pdfium_doc = pdfium.PdfDocument(content)
+                            except Exception as open_err:
+                                print(f"[pdf] pdfium open failed: {open_err!r}")
+                                ocr_ready = False
+                    if not ocr_ready or pdfium_doc is None:
+                        text_chunks.append("")
+                        continue
+                    page_started = _time.monotonic()
+                    try:
+                        words = _ocr_page_words_from_doc(pdfium_doc, page_idx)
+                    except Exception as ocr_err:
+                        if pytesseract is not None and isinstance(
+                            ocr_err, pytesseract.TesseractNotFoundError
+                        ):
+                            tesseract_missing = True
+                            ocr_ready = False
+                        words = None
+                    page_elapsed = _time.monotonic() - page_started
+                    if words:
+                        pages_ocred += 1
+                        text_chunks.append(_ocr_page_text(words))
+                        reconstructed = _extract_transactions_from_words(words, y_tol=4.0)
+                        if reconstructed and len(reconstructed) >= 2:
+                            chunk = _merge_flat_rows_from_tables([reconstructed])
+                        print(
+                            f"[pdf] ocr page {page_idx + 1}: {len(words)} words, "
+                            f"table_rows={len(reconstructed) if reconstructed else 0}, "
+                            f"{page_elapsed:.1f}s"
+                        )
+                    else:
+                        text_chunks.append("")
+                        print(f"[pdf] ocr page {page_idx + 1}: no words recognised ({page_elapsed:.1f}s)")
+                    # Force cleanup of the page-sized OCR buffers before moving on
+                    # so peak RSS stays close to one page worth on small hosts.
+                    _gc.collect()
+
+                if len(chunk) > 1:
+                    if not all_rows:
+                        all_rows.extend(chunk)
+                    else:
+                        h0 = all_rows[0]
+                        start_row = 1 if _rows_equal_as_header(chunk[0], h0) else 0
+                        all_rows.extend(chunk[start_row:])
+    finally:
+        if pdfium_doc is not None:
+            try:
+                pdfium_doc.close()
+            except Exception:
+                pass
 
     if len(all_rows) < 2:
         if tesseract_missing:
@@ -1545,89 +1616,121 @@ def _chat_with_model(
         )
         return str(resp.content).strip()
 
-    @tool("document_finance_calculations")
-    def document_finance_calculations(question: str) -> str:
-        """Use for calculation-heavy questions about uploaded statement data (totals on dates, sums over ranges)."""
-        if not session:
-            return "Please upload a statement first so I can run calculations on your document."
-        df = session.frame.copy()
-        planner = llm.with_structured_output(CalcPlan)
-        plan = planner.invoke(
-            "Extract a calculation plan from the user question. "
-            "Use the prior conversation to resolve follow-up references such as 'that day', "
-            "'the same week', or implicit dates carried from previous turns.\n"
-            "Operations: sum_metric_on_date, total_metric, sum_metric_between_dates, avg_daily_metric.\n"
-            "Metric must be one of expense,income,balance,amount.\n"
-            "Return ISO dates (YYYY-MM-DD) when dates are provided.\n\n"
-            f"{history_block}Current question: {question}"
-        )
+    def _structured_statement_answer(df: pd.DataFrame, currency: str) -> str:
+        """Ask the planner for a precise numeric answer; return '' if it can't."""
+        try:
+            planner = llm.with_structured_output(CalcPlan)
+            plan = planner.invoke(
+                "Extract a calculation plan from the user question. "
+                "Use the prior conversation to resolve follow-up references such as 'that day', "
+                "'the same week', or implicit dates carried from previous turns.\n"
+                "Operations: sum_metric_on_date, total_metric, sum_metric_between_dates, avg_daily_metric.\n"
+                "Metric must be one of expense,income,balance,amount.\n"
+                "Return ISO dates (YYYY-MM-DD) when dates are provided.\n\n"
+                f"{history_block}Current question: {question}"
+            )
+        except Exception:
+            return ""
         metric = plan.metric if plan.metric in {"expense", "income", "balance", "amount"} else "expense"
-
-        result_text = ""
+        if metric not in df.columns:
+            return ""
         if plan.operation == "sum_metric_on_date":
             d = _parse_date_safe(plan.date)
-            if d is not None:
-                mask = df["date"].dt.date == d.date()
-                total = float(df.loc[mask, metric].sum()) if metric in df.columns else 0.0
-                result_text = f"{metric} on {d.date().isoformat()} = {session.currency} {total:,.2f}"
-        elif plan.operation == "sum_metric_between_dates":
-            d0 = _parse_date_safe(plan.start_date)
-            d1 = _parse_date_safe(plan.end_date)
-            if d0 is not None and d1 is not None and metric in df.columns:
-                mask = (df["date"] >= d0) & (df["date"] <= d1)
-                total = float(df.loc[mask, metric].sum())
-                result_text = (
-                    f"{metric} from {d0.date().isoformat()} to {d1.date().isoformat()} "
-                    f"= {session.currency} {total:,.2f}"
-                )
-        elif plan.operation == "avg_daily_metric":
-            if metric in df.columns and len(df):
-                by_day = df.groupby(df["date"].dt.date)[metric].sum()
-                avg = float(by_day.mean()) if len(by_day) else 0.0
-                result_text = f"average daily {metric} = {session.currency} {avg:,.2f}"
-        else:  # total_metric + unknown
-            if metric in df.columns:
-                total = float(df[metric].sum())
-                result_text = f"total {metric} = {session.currency} {total:,.2f}"
+            if d is None:
+                return ""
+            mask = df["date"].dt.date == d.date()
+            total = float(df.loc[mask, metric].sum())
+            return f"{metric} on {d.date().isoformat()} = {currency} {total:,.2f}"
+        if plan.operation == "sum_metric_between_dates":
+            d0, d1 = _parse_date_safe(plan.start_date), _parse_date_safe(plan.end_date)
+            if d0 is None or d1 is None:
+                return ""
+            mask = (df["date"] >= d0) & (df["date"] <= d1)
+            total = float(df.loc[mask, metric].sum())
+            return (
+                f"{metric} from {d0.date().isoformat()} to {d1.date().isoformat()} "
+                f"= {currency} {total:,.2f}"
+            )
+        if plan.operation == "avg_daily_metric" and len(df):
+            by_day = df.groupby(df["date"].dt.date)[metric].sum()
+            avg = float(by_day.mean()) if len(by_day) else 0.0
+            return f"average daily {metric} = {currency} {avg:,.2f}"
+        total = float(df[metric].sum())
+        return f"total {metric} = {currency} {total:,.2f}"
 
-        sample = df[["date", "description", "expense", "income"]].head(120).to_csv(index=False)
-        resp = llm.invoke(
-            "You are a financial assistant. Use the computed result and dataframe sample to answer. "
-            "Use prior conversation to handle follow-ups. "
-            "If computed_result is empty, explain what data is missing and suggest a precise question.\n\n"
-            f"{history_block}Current question: {question}\nComputed_result: {result_text}\nData sample:\n{sample}"
-        )
-        return str(resp.content).strip()
+    @tool("document_statement_qa")
+    def document_statement_qa(question: str) -> str:
+        """Answer ANY question about the user's uploaded bank statement.
 
-    @tool("document_finance_non_calculation")
-    def document_finance_non_calculation(question: str) -> str:
-        """Use for non-calculation questions about the uploaded document using chunked document text context."""
+        Covers sums, date-range queries, top transactions, category breakdowns,
+        narrative questions ("what's my biggest recurring expense?"), and lookups
+        of specific entries. Grounds answers in both the structured transactions
+        and the raw extracted statement text."""
         if not session:
-            return "Please upload a statement first so I can answer document-specific questions."
+            return (
+                "No bank statement is currently loaded on the server. "
+                "Upload one on the dashboard, then ask this question again."
+            )
+
+        df = session.frame.copy()
+        currency = session.currency or ""
+
+        computed = _structured_statement_answer(df, currency)
+
         retrieval_query = question if not history_text else f"{question}\n{history_text[-400:]}"
         selected = _retrieve_chunks(retrieval_query, session.source_text, top_k=4)
-        context = "\n\n---\n\n".join(selected) if selected else "No extracted statement text found."
-        resp = llm.invoke(
-            "You answer using only the statement chunks. Use prior conversation to "
-            "resolve follow-up references. If the answer is not present, say it's not in the document.\n\n"
-            f"{history_block}Current question: {question}\n\nStatement chunks:\n{context}"
+        text_context = "\n\n---\n\n".join(selected) if selected else "(no raw statement text available)"
+
+        summary = session.analytics.get("summary", {})
+        summary_text = (
+            f"Total income: {currency} {summary.get('totalIncome', 0):,.2f}\n"
+            f"Total expenses: {currency} {summary.get('totalExpenses', 0):,.2f}\n"
+            f"Net balance: {currency} {summary.get('netBalance', 0):,.2f}"
         )
+        sample_cols = [c for c in ("date", "description", "expense", "income", "amount", "balance") if c in df.columns]
+        sample_csv = df[sample_cols].head(80).to_csv(index=False) if sample_cols else df.head(80).to_csv(index=False)
+
+        prompt = (
+            "You are a financial assistant answering questions strictly about the user's "
+            "uploaded bank statement. Prefer the structured transaction sample for "
+            "calculations and the raw statement text for descriptive/narrative context. "
+            "If a requested figure cannot be derived from the provided data, say so plainly "
+            "and suggest a more precise question (e.g. a specific date range). "
+            "Use the prior conversation to resolve follow-up references.\n\n"
+            f"{history_block}"
+            f"Current question: {question}\n\n"
+            f"Statement summary:\n{summary_text}\n\n"
+            f"Precomputed figure (may be empty if not applicable): {computed or '(none)'}\n\n"
+            f"Transaction sample (first 80 rows, CSV):\n{sample_csv}\n\n"
+            f"Relevant raw statement text:\n{text_context}"
+        )
+        resp = llm.invoke(prompt)
         return str(resp.content).strip()
 
     tools = [
         general_finance_timeless,
         general_finance_realtime_web,
-        document_finance_calculations,
-        document_finance_non_calculation,
+        document_statement_qa,
     ]
     router = llm.bind_tools(tools, tool_choice="auto")
+    session_hint = (
+        "A bank statement IS currently loaded — strongly prefer document_statement_qa "
+        "whenever the user is asking anything that could plausibly refer to their own "
+        "transactions, balances, spending, income, or any numbers/entries on the statement."
+        if session is not None
+        else "NO bank statement is loaded — do NOT call document_statement_qa."
+    )
     routing_input = (
+        f"{session_hint}\n\n"
         f"{history_block}Current question: {question}\n\n"
         "Pick the single best tool to answer the current question, taking the recent "
         "conversation into account so follow-ups are routed consistently with prior turns."
-    ) if history_text else question
+    )
     routed = router.invoke(routing_input)
     if not getattr(routed, "tool_calls", None):
+        # No tool chosen — pick a sensible default based on whether a statement is loaded.
+        if session is not None:
+            return document_statement_qa.invoke({"question": question}), "document", "document_statement_qa"
         return general_finance_timeless.invoke({"question": question}), "general", "general_finance_timeless"
 
     call = routed.tool_calls[0]
@@ -1636,8 +1739,7 @@ def _chat_with_model(
     tool_map: dict[str, tuple[Callable, str]] = {
         "general_finance_timeless": (general_finance_timeless, "general"),
         "general_finance_realtime_web": (general_finance_realtime_web, "general"),
-        "document_finance_calculations": (document_finance_calculations, "document"),
-        "document_finance_non_calculation": (document_finance_non_calculation, "document"),
+        "document_statement_qa": (document_statement_qa, "document"),
     }
     selected_tool, route = tool_map.get(tool_name, (general_finance_timeless, "general"))
     result = selected_tool.invoke(tool_args if isinstance(tool_args, dict) else {"question": question})

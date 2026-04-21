@@ -243,7 +243,7 @@ OCR-related env vars (all optional):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OCR_DPI` | `300` | Rendering resolution fed to Tesseract. `200` is ~2x faster with a small accuracy hit; `300` is the sweet spot; `400+` rarely helps. |
+| `OCR_DPI` | `200` | Rendering resolution fed to Tesseract. `200` is the memory-safe default (peak RSS ~250 MB on a 28-page A4 scan); `300` is sharper and needs roughly 2.3x the RAM; `400+` rarely helps. |
 | `TESSERACT_LANG` | `eng` | Comma-separated languages (e.g. `eng+fra`). Requires the matching `tesseract-ocr-<lang>` package to also be installed. |
 | `TESSERACT_CONFIG` | `--oem 1 --psm 6 -c preserve_interword_spaces=1` | Tesseract CLI flags. `--psm 6` treats each page as a single text block (correct for statements). Change only if you know what you're doing. |
 | `TESSERACT_CMD` | auto-detected | Absolute path to the binary. |
@@ -264,7 +264,7 @@ Backend (`backend/app.py`):
 | `TESSERACT_CMD` | auto-detected | Explicit path to the Tesseract binary for OCR. |
 | `TESSERACT_LANG` | `eng` | Language(s) passed to Tesseract, e.g. `eng+fra`. |
 | `TESSERACT_CONFIG` | `--oem 1 --psm 6 -c preserve_interword_spaces=1` | Tesseract CLI flags. |
-| `OCR_DPI` | `300` | Render DPI for OCR. Lower = faster, higher = more accurate. |
+| `OCR_DPI` | `200` | Render DPI for OCR. Lower = faster + less memory, higher = more accurate. Raise to `300` on hosts with >= 1 GB RAM. |
 | `MAX_PDF_PAGES` | `100000` (effectively unlimited) | Optional hard cap on pages processed per PDF. |
 | `PDF_TIME_BUDGET_SECONDS` | unset (no budget) | Optional wall-clock cap on PDF parsing time. |
 | `MAX_UPLOAD_BYTES` | `31457280` (30 MB) | Max upload size. |
