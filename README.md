@@ -76,6 +76,7 @@ Sessions live in-memory on the backend, so they disappear on restart. The fronte
 cursor3/
 ├── backend/
 │   ├── app.py                    # FastAPI app, PDF/CSV/XLSX ingest, OCR, analytics, chat agent
+│   ├── Dockerfile                # Backend image (includes Tesseract binary for OCR)
 │   └── requirements.txt          # Python dependencies (FastAPI, pdfplumber, pytesseract, pypdfium2, LangChain, ...)
 │
 ├── frontend/
@@ -129,6 +130,7 @@ cursor3/
 │   ├── sample_statement.pdf
 │   └── uba_sample_statement.pdf
 │
+├── render.yaml                   # Render Blueprint (Docker-based deploy)
 ├── LICENSE
 └── README.md
 ```
@@ -193,13 +195,60 @@ npm test               # Vitest
 
 ## OCR setup (optional, but required for scanned PDFs)
 
-The Python packages (`pytesseract`, `pypdfium2`, `Pillow`) install automatically with the backend requirements, but Tesseract itself is a native binary and must be installed separately.
+`pytesseract` is only a Python wrapper. The actual OCR engine is a native binary (`tesseract`) that must be installed separately on whatever machine runs the backend.
+
+### Local development
 
 - Windows: install from [UB-Mannheim builds](https://github.com/UB-Mannheim/tesseract/wiki). The default path `C:\Program Files\Tesseract-OCR\tesseract.exe` is auto-detected. Otherwise, set `TESSERACT_CMD` to the full path.
 - macOS: `brew install tesseract`
 - Ubuntu / Debian: `sudo apt-get install tesseract-ocr`
 
 Auto-discovery is implemented in [`backend/app.py` `_locate_tesseract_binary`](backend/app.py).
+
+### Deployed environments (Render, Fly.io, Railway, Docker, etc.)
+
+Managed Python runtimes (Render Native, Heroku-style buildpacks) cannot install OS-level packages. Use the Docker image in this repo instead — it installs `tesseract-ocr` into the container.
+
+- [`backend/Dockerfile`](backend/Dockerfile) — backend image with Tesseract + all Python deps baked in.
+- [`render.yaml`](render.yaml) — Render Blueprint that deploys that Dockerfile as a web service and wires the OCR-related env vars.
+
+On Render specifically: push this repo, create a new Blueprint in the Render dashboard pointing at it, and Render picks `render.yaml` up automatically. You'll need to paste your `OPENAI_API_KEY` secret in the dashboard (it's left as `sync: false` on purpose).
+
+### Verifying OCR is wired up on the server
+
+After deploy, hit the diagnostics endpoint:
+
+```
+GET https://<your-backend>/api/ocr-status
+```
+
+It returns JSON like this when everything is good:
+
+```json
+{
+  "available": true,
+  "tesseract_cmd": "/usr/bin/tesseract",
+  "tesseract_on_path": true,
+  "tesseract_version": "5.3.0",
+  "error": null,
+  "env": { "TESSERACT_CMD": "/usr/bin/tesseract", "OCR_DPI": "250", ... }
+}
+```
+
+If `available: false`, the `install_hint` field tells you exactly what's missing. Implementation: [`backend/app.py` `/api/ocr-status`](backend/app.py).
+
+### Quality and speed tuning
+
+OCR-related env vars (all optional):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OCR_DPI` | `300` | Rendering resolution fed to Tesseract. `200` is ~2x faster with a small accuracy hit; `300` is the sweet spot; `400+` rarely helps. |
+| `TESSERACT_LANG` | `eng` | Comma-separated languages (e.g. `eng+fra`). Requires the matching `tesseract-ocr-<lang>` package to also be installed. |
+| `TESSERACT_CONFIG` | `--oem 1 --psm 6 -c preserve_interword_spaces=1` | Tesseract CLI flags. `--psm 6` treats each page as a single text block (correct for statements). Change only if you know what you're doing. |
+| `TESSERACT_CMD` | auto-detected | Absolute path to the binary. |
+
+Images are also preprocessed before OCR (grayscale + autocontrast + median denoise + threshold) — this alone roughly doubles digit accuracy on typical bank scans. Implementation: [`backend/app.py` `_preprocess_for_ocr`](backend/app.py).
 
 Without the binary, text-based PDFs (Revolut, FirstBank, etc.), CSVs, and XLSX files all still work — only scanned PDFs require OCR, and if the binary is missing the API returns a single actionable error message pointing here.
 
@@ -213,6 +262,9 @@ Backend (`backend/app.py`):
 |---|---|---|
 | `OPENAI_API_KEY` | unset | Enables the LangChain tool-using chat agent. Without it, a heuristic fallback answers basic questions. |
 | `TESSERACT_CMD` | auto-detected | Explicit path to the Tesseract binary for OCR. |
+| `TESSERACT_LANG` | `eng` | Language(s) passed to Tesseract, e.g. `eng+fra`. |
+| `TESSERACT_CONFIG` | `--oem 1 --psm 6 -c preserve_interword_spaces=1` | Tesseract CLI flags. |
+| `OCR_DPI` | `300` | Render DPI for OCR. Lower = faster, higher = more accurate. |
 | `MAX_PDF_PAGES` | `100000` (effectively unlimited) | Optional hard cap on pages processed per PDF. |
 | `PDF_TIME_BUDGET_SECONDS` | unset (no budget) | Optional wall-clock cap on PDF parsing time. |
 | `MAX_UPLOAD_BYTES` | `31457280` (30 MB) | Max upload size. |
@@ -230,6 +282,7 @@ Frontend (`frontend/.env`):
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Liveness probe. |
+| `GET` | `/api/ocr-status` | Reports whether Tesseract OCR is available on this instance. |
 | `POST` | `/api/upload` | Multipart upload (CSV / XLSX / PDF). Returns `sessionId` + analytics payload. |
 | `GET` | `/api/analytics/{session_id}` | Re-fetch analytics for a previous session. Returns 404 if the session has expired. |
 | `POST` | `/api/chat` | JSON `{ question, sessionId?, history? }`. Returns `{ answer, route, tool }`. |

@@ -1,0 +1,32 @@
+# Render Blueprint (https://render.com/docs/blueprint-spec)
+#
+# Deploys the backend as a Docker service so the native Tesseract binary
+# (installed in backend/Dockerfile) is available for OCR on scanned PDFs.
+#
+# To deploy: push this repo to GitHub, then in the Render dashboard choose
+# "Blueprint" and point it at the repo. Render will pick up this file.
+services:
+  - type: web
+    name: pocketwatch-backend
+    env: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TESSERACT_CMD
+        value: /usr/bin/tesseract
+      - key: TESSERACT_LANG
+        value: eng
+      # Render Starter has ~512 MB RAM; 300 DPI OCR on 10+ pages can peak high.
+      # Drop to 200 here if you see OOMs in logs.
+      - key: OCR_DPI
+        value: "250"
+      # Optional safety caps (unset = no limit). Keep unset to process long PDFs.
+      # - key: MAX_PDF_PAGES
+      #   value: "200"
+      # - key: PDF_TIME_BUDGET_SECONDS
+      #   value: "300"
