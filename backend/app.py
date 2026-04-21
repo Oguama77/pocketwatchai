@@ -285,25 +285,113 @@ def _to_float(series: pd.Series) -> pd.Series:
     return pd.to_numeric(parsed, errors="coerce")
 
 
+_MONEY_COLUMN_ANCHORS: dict[str, tuple[str, ...]] = {
+    "debit": (
+        "dr amount", "amount dr", "debit amount",
+        "debit", "debits", "debited",
+        "withdrawal", "withdrawals", "withdrawn",
+        "outflow", "outflows",
+        "paid out", "paidout",
+        "money out", "moneyout",
+        "charge", "charges", "charged",
+    ),
+    "credit": (
+        "cr amount", "amount cr", "credit amount",
+        "credit", "credits", "credited",
+        "deposit", "deposits", "deposited",
+        "inflow", "inflows",
+        "paid in", "paidin",
+        "money in", "moneyin",
+        "received", "incoming",
+    ),
+    "amount": (
+        "transaction amount", "txn amount",
+        "amount", "amt",
+    ),
+    "balance": (
+        "running balance", "closing balance", "account balance",
+        "ledger balance", "available balance",
+        "balance",
+    ),
+}
+
+
+def _match_money_column_by_tokens(normalized: str) -> str | None:
+    """Fallback matcher for money columns when the header has trailing noise.
+
+    Handles cases the exact-alias matcher misses, e.g. Nigerian bank statements
+    whose headers read 'Withdrawals (₦)', 'Debit(NGN)', 'DR Amount',
+    'Amount Debited', or OCR output like 'Debii'. Prefers longer / multi-word
+    anchors, and skips the ambiguous single-letter markers 'dr'/'cr' because
+    'dr' also appears in words like 'drawn' / 'driver' / 'dr.' in narratives."""
+    if not normalized:
+        return None
+    tokens = set(normalized.split())
+    best_match: tuple[int, str] | None = None
+    for canonical, anchors in _MONEY_COLUMN_ANCHORS.items():
+        for anchor in anchors:
+            if " " in anchor:
+                if anchor in normalized:
+                    score = len(anchor)
+                    if best_match is None or score > best_match[0]:
+                        best_match = (score, canonical)
+            else:
+                if anchor in tokens:
+                    score = len(anchor)
+                    if best_match is None or score > best_match[0]:
+                        best_match = (score, canonical)
+    return best_match[1] if best_match else None
+
+
 def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     renames: dict[str, str] = {}
     description_loosely_assigned = False
+    claimed: set[str] = set()
+
+    # Pass 1: strict exact / alias match — preserve previous behaviour for
+    # clean headers so nothing regresses.
     for col in df.columns:
         normalized = _norm_col(str(col))
-        matched = False
         for canonical, aliases in CANONICAL_COLUMNS.items():
+            if canonical in claimed:
+                continue
             if normalized == canonical or normalized in aliases:
                 renames[col] = canonical
-                matched = True
+                claimed.add(canonical)
                 break
-        if not matched:
-            if "date" in normalized and canonical_date_like(normalized):
-                renames[col] = "date"
-            elif not description_loosely_assigned and any(
-                k in normalized for k in ("memo", "narrative", "payee", "details", "description")
-            ):
-                renames[col] = "description"
-                description_loosely_assigned = True
+
+    # Pass 2: fuzzy token match for money columns only (debit/credit/amount/
+    # balance). This is where most real-world headers fail the strict match —
+    # 'Withdrawals (₦)' -> 'withdrawals n', 'DR Amount' -> 'dr amount', etc.
+    for col in df.columns:
+        if col in renames:
+            continue
+        normalized = _norm_col(str(col))
+        fuzzy = _match_money_column_by_tokens(normalized)
+        if fuzzy and fuzzy not in claimed:
+            renames[col] = fuzzy
+            claimed.add(fuzzy)
+
+    # Pass 3: loose fallbacks for date / description if still missing.
+    for col in df.columns:
+        if col in renames:
+            continue
+        normalized = _norm_col(str(col))
+        if "date" in normalized and canonical_date_like(normalized) and "date" not in claimed:
+            renames[col] = "date"
+            claimed.add("date")
+        elif (
+            not description_loosely_assigned
+            and any(
+                k in normalized
+                for k in ("memo", "narrative", "payee", "details", "description", "narration", "particulars")
+            )
+            and "description" not in claimed
+        ):
+            renames[col] = "description"
+            claimed.add("description")
+            description_loosely_assigned = True
+
     return df.rename(columns=renames)
 
 
@@ -1872,6 +1960,48 @@ def analytics(session_id: str) -> dict:
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     return {"sessionId": session_id, **session.analytics}
+
+
+@app.get("/api/debug/frame/{session_id}")
+def debug_frame(session_id: str) -> dict:
+    """Diagnostics: returns what the parser extracted for a session.
+
+    Use this when the numbers in the dashboard look wrong (e.g. totals of 0).
+    It shows the canonical columns the parser detected, a preview of the first
+    10 rows, and the sum of each money column so you can tell at a glance
+    whether the debit/credit/amount columns were recognised at all.
+
+    Does NOT return any credentials or server-side state — just the data you
+    already uploaded in that session."""
+    session = SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    df = session.frame
+    money_cols = [c for c in ("debit", "credit", "amount", "balance", "expense", "income") if c in df.columns]
+    column_sums = {}
+    for c in money_cols:
+        try:
+            column_sums[c] = float(pd.to_numeric(df[c], errors="coerce").fillna(0).sum())
+        except Exception as err:
+            column_sums[c] = f"(error: {type(err).__name__}: {err})"
+    preview_cols = list(df.columns)[:20]
+    preview_rows = df[preview_cols].head(10).astype(str).values.tolist()
+    return {
+        "sessionId": session_id,
+        "currency": session.currency,
+        "detected_columns": list(df.columns),
+        "money_columns_recognised": money_cols,
+        "money_column_sums": column_sums,
+        "row_count": int(len(df)),
+        "preview_columns": preview_cols,
+        "preview_rows": preview_rows,
+        "note": (
+            "If 'money_columns_recognised' is empty or missing debit/credit/amount, "
+            "your statement header didn't match any known alias and the totals will be 0. "
+            "Check 'detected_columns' — if you see something like 'Withdrawal (₦)' there, "
+            "the fuzzy matcher in _canonicalise_columns should now catch it."
+        ),
+    }
 
 
 @app.post("/api/chat")
