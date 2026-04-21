@@ -2,7 +2,7 @@
 
 A personal-finance analyst for bank statements. Upload a statement (CSV, XLSX, or PDF - text or scanned), get instant analytics, and chat with an LLM-backed agent that can answer questions grounded in your actual transactions.
 
-The backend is a FastAPI service that parses statements with a multi-strategy pipeline (pdfplumber ruled tables → word-position reconstruction → Tesseract OCR fallback), auto-detects the statement currency, and builds summary + chart-ready analytics. The frontend is a Vite + React + TypeScript SPA with a dashboard, a chart view, and a persistent chat interface wired to a LangChain tool-using agent.
+The backend is a FastAPI service that parses statements with a multi-strategy pipeline (pdfplumber ruled tables → word-position reconstruction → Tesseract OCR fallback), auto-detects the statement currency, and builds summary + chart-ready analytics. The frontend is a Vite + React + TypeScript SPA with a dashboard, a chart view, and a persistent chat interface wired to a LangChain tool-using agent. Find the web application [here](https://pocketwatchai-opal.vercel.app)
 
 ---
 
