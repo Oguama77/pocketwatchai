@@ -30,6 +30,14 @@
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 0 0% 100%;
 
+    /* Inline user-facing notices (upload / analytics errors). Dark forest
+       green so it reads as an informational message rather than a hostile
+       red alert. Background is a very soft tint of the same hue. */
+    --notice: 155 65% 18%;
+    --notice-foreground: 155 65% 18%;
+    --notice-bg: 150 55% 94%;
+    --notice-border: 150 40% 80%;
+
     --border: 0 0% 90%;
     --input: 0 0% 90%;
     --ring: 155 93% 14%;
@@ -76,6 +84,10 @@
     --accent-foreground: 150 10% 95%;
     --destructive: 0 62.8% 30.6%;
     --destructive-foreground: 0 0% 100%;
+    --notice: 150 55% 75%;
+    --notice-foreground: 150 55% 82%;
+    --notice-bg: 155 25% 14%;
+    --notice-border: 155 25% 25%;
     --border: 155 15% 18%;
     --input: 155 15% 18%;
     --ring: 150 60% 45%;

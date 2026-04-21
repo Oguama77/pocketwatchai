@@ -72,7 +72,11 @@ export default function Dashboard() {
         </div>
 
         <FileUpload onUploaded={handleUploaded} />
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <p className="text-sm text-notice bg-notice-bg border border-notice-border rounded-lg px-3 py-2">
+            {error}
+          </p>
+        )}
         {loading && <p className="text-sm text-muted-foreground">Loading analytics...</p>}
         <SummaryCards summary={analytics.summary} currency={analytics.currency} />
 

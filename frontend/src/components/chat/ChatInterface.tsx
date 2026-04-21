@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Send } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/store/useAppStore";
@@ -99,13 +101,98 @@ export function ChatInterface() {
             >
               <div
                 className={cn(
-                  "max-w-[75%] px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap",
+                  "max-w-[75%] px-4 py-3 rounded-2xl text-sm leading-relaxed",
                   msg.role === "user"
-                    ? "chat-bubble-user rounded-br-md"
+                    ? "chat-bubble-user rounded-br-md whitespace-pre-wrap"
                     : "chat-bubble-ai rounded-bl-md"
                 )}
               >
-                {msg.content}
+                {msg.role === "assistant" ? (
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      p: ({ children }) => (
+                        <p className="mb-2 last:mb-0 whitespace-pre-wrap">{children}</p>
+                      ),
+                      strong: ({ children }) => (
+                        <strong className="font-semibold">{children}</strong>
+                      ),
+                      em: ({ children }) => <em className="italic">{children}</em>,
+                      ul: ({ children }) => (
+                        <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>
+                      ),
+                      ol: ({ children }) => (
+                        <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>
+                      ),
+                      li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                      h1: ({ children }) => (
+                        <h1 className="text-base font-semibold mt-1 mb-2">{children}</h1>
+                      ),
+                      h2: ({ children }) => (
+                        <h2 className="text-sm font-semibold mt-1 mb-2">{children}</h2>
+                      ),
+                      h3: ({ children }) => (
+                        <h3 className="text-sm font-semibold mt-1 mb-1">{children}</h3>
+                      ),
+                      a: ({ children, href }) => (
+                        <a
+                          href={href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="underline text-primary break-all"
+                        >
+                          {children}
+                        </a>
+                      ),
+                      code: ({ className, children, ...props }) => {
+                        const isInline = !className;
+                        if (isInline) {
+                          return (
+                            <code
+                              className="px-1 py-0.5 rounded bg-muted text-foreground/90 text-[0.85em]"
+                              {...props}
+                            >
+                              {children}
+                            </code>
+                          );
+                        }
+                        return (
+                          <code className="block text-[0.85em]" {...props}>
+                            {children}
+                          </code>
+                        );
+                      },
+                      pre: ({ children }) => (
+                        <pre className="my-2 p-3 rounded-lg bg-muted overflow-x-auto text-xs">
+                          {children}
+                        </pre>
+                      ),
+                      blockquote: ({ children }) => (
+                        <blockquote className="border-l-2 border-muted-foreground/30 pl-3 italic my-2">
+                          {children}
+                        </blockquote>
+                      ),
+                      table: ({ children }) => (
+                        <div className="overflow-x-auto my-2">
+                          <table className="min-w-full text-xs border-collapse">{children}</table>
+                        </div>
+                      ),
+                      th: ({ children }) => (
+                        <th className="border border-border px-2 py-1 text-left font-semibold">
+                          {children}
+                        </th>
+                      ),
+                      td: ({ children }) => (
+                        <td className="border border-border px-2 py-1 align-top">{children}</td>
+                      ),
+                      hr: () => <hr className="my-3 border-border" />,
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                ) : (
+                  msg.content
+                )}
               </div>
             </div>
           ))}

@@ -138,7 +138,11 @@ export function FileUpload({ onUploaded }: FileUploadProps) {
             )}
           </div>
         )}
-        {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+        {error && (
+          <p className="mt-3 text-sm text-notice bg-notice-bg border border-notice-border rounded-lg px-3 py-2">
+            {error}
+          </p>
+        )}
         {file && !uploadedFileName && (
           <div className="mt-4 flex items-center gap-2 text-sm p-2 rounded-md bg-muted">
             <FileText className="h-4 w-4 text-primary" />
