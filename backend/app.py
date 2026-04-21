@@ -29,6 +29,99 @@ except ImportError:  # pragma: no cover
     ChatOpenAI = None
     DuckDuckGoSearchResults = None
 
+try:
+    import pytesseract
+except ImportError:  # pragma: no cover
+    pytesseract = None
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:  # pragma: no cover
+    pdfium = None
+
+
+_TESSERACT_PROBE_CACHE: dict[str, bool] = {}
+
+
+def _locate_tesseract_binary() -> str | None:
+    """Best-effort auto-discovery of the Tesseract executable.
+
+    Checks (in order):
+      1. An explicit TESSERACT_CMD env var,
+      2. the value already configured on pytesseract (PATH lookup),
+      3. standard Windows install paths,
+      4. standard macOS / Linux paths.
+    """
+    if pytesseract is None:
+        return None
+
+    import shutil
+
+    env = os.getenv("TESSERACT_CMD")
+    if env and os.path.isfile(env):
+        return env
+
+    configured = pytesseract.pytesseract.tesseract_cmd
+    if configured:
+        found = shutil.which(configured)
+        if found:
+            return found
+        if os.path.isfile(configured):
+            return configured
+
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+        "/usr/local/bin/tesseract",
+        "/usr/bin/tesseract",
+        "/opt/homebrew/bin/tesseract",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _ocr_available() -> bool:
+    """Check whether OCR can actually run: pytesseract importable AND the Tesseract binary present."""
+    if pytesseract is None or pdfium is None:
+        return False
+    cached = _TESSERACT_PROBE_CACHE.get("ok")
+    if cached is not None:
+        return cached
+    binary = _locate_tesseract_binary()
+    if binary:
+        pytesseract.pytesseract.tesseract_cmd = binary
+    try:
+        pytesseract.get_tesseract_version()
+        _TESSERACT_PROBE_CACHE["ok"] = True
+        return True
+    except Exception:
+        _TESSERACT_PROBE_CACHE["ok"] = False
+        return False
+
+
+def _ocr_install_hint() -> str:
+    """Actionable install hint when OCR deps (or the Tesseract binary) are missing."""
+    missing = []
+    if pytesseract is None:
+        missing.append("the 'pytesseract' Python package")
+    if pdfium is None:
+        missing.append("the 'pypdfium2' Python package")
+    if missing:
+        return (
+            f"Install {', '.join(missing)} (see backend/requirements.txt) and restart the server."
+        )
+    return (
+        "The Tesseract OCR binary was not found. Install it and make sure it is on PATH, "
+        "or set TESSERACT_CMD to its full path:\n"
+        "  - Windows: https://github.com/UB-Mannheim/tesseract/wiki "
+        r"(default install path C:\Program Files\Tesseract-OCR\tesseract.exe)"
+        "\n  - macOS:   brew install tesseract"
+        "\n  - Ubuntu:  sudo apt-get install tesseract-ocr"
+    )
+
 
 CANONICAL_COLUMNS = {
     "date": {
@@ -293,19 +386,32 @@ def _dedupe_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _max_pdf_pages() -> int:
-    """Cap pages processed to avoid OOM / very long requests on small hosts (e.g. Render free tier)."""
+    """Process every page of the uploaded PDF by default.
+
+    MAX_PDF_PAGES can still override the cap via env if a deployment wants a
+    hard safety limit, but the default is effectively unlimited so long
+    statements (e.g. 50+ pages) are no longer truncated."""
     try:
-        return max(1, min(500, int(os.getenv("MAX_PDF_PAGES", "40"))))
+        value = int(os.getenv("MAX_PDF_PAGES", "100000"))
+        return max(1, value)
     except ValueError:
-        return 40
+        return 100000
 
 
 def _pdf_time_budget_seconds() -> float:
-    """Hard cap on total PDF table-extraction time. Prevents Render workers being killed for inactivity."""
+    """No enforced processing budget by default.
+
+    OCR of scanned PDFs is slow (several seconds per page). PDF_TIME_BUDGET_SECONDS
+    can still set an explicit cap for deployments that need one, but we no longer
+    cut parsing short on purpose."""
+    raw = os.getenv("PDF_TIME_BUDGET_SECONDS")
+    if raw is None:
+        return float("inf")
     try:
-        return max(5.0, min(120.0, float(os.getenv("PDF_TIME_BUDGET_SECONDS", "55"))))
+        value = float(raw)
+        return value if value > 0 else float("inf")
     except ValueError:
-        return 55.0
+        return float("inf")
 
 
 def _max_upload_bytes() -> int:
@@ -454,12 +560,13 @@ def _assign_word_to_column(word: dict, columns: list[tuple[str, float, float]]) 
     return picked
 
 
-def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
-    """Reconstruct a transaction table from word x-coordinates.
+def _extract_transactions_from_words(words: list[dict], y_tol: float = 2.5) -> list[list[str]] | None:
+    """Reconstruct a transaction table from positioned words (pdfplumber or OCR).
 
     Works for PDFs where pdfplumber's ruled-table extraction fails or mangles
     rows (Revolut has no table rules at all; FirstBank has rules but rows are
-    collapsed into a single cell). Steps:
+    collapsed into a single cell), AND for OCR output from scanned PDFs where
+    Tesseract provides per-word bounding boxes. Steps:
       1. Group words into visual lines.
       2. Detect the header line (must mention a 'date' column + >=3 known terms).
       3. Derive column x-ranges from header word clusters.
@@ -467,14 +574,10 @@ def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
          transaction begins when the date column matches a date pattern,
          otherwise the line is a continuation of the current transaction.
     """
-    try:
-        words = page.extract_words(use_text_flow=False)
-    except Exception:
-        return None
     if not words:
         return None
 
-    lines = _group_words_by_line(words, y_tol=2.5)
+    lines = _group_words_by_line(words, y_tol=y_tol)
     header_idx = -1
     best_score = 0
     for i, line in enumerate(lines):
@@ -526,6 +629,85 @@ def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
         return None
     header_labels = [c[0] for c in columns]
     return [header_labels] + rows
+
+
+def _extract_transactions_by_word_positions(page) -> list[list[str]] | None:
+    """Thin adapter: pull pdfplumber words from a native Page and parse them."""
+    try:
+        words = page.extract_words(use_text_flow=False)
+    except Exception:
+        return None
+    return _extract_transactions_from_words(words, y_tol=2.5)
+
+
+def _ocr_page_words(pdf_bytes: bytes, page_idx: int, dpi: int = 300) -> list[dict] | None:
+    """OCR a single PDF page and return words in pdfplumber-style dicts.
+
+    Coordinates are returned in typographic points (72 dpi) so the downstream
+    word-position parser — tuned for pdfplumber word boxes — works unchanged."""
+    if pytesseract is None or pdfium is None:
+        return None
+    try:
+        pdf_doc = pdfium.PdfDocument(pdf_bytes)
+    except Exception:
+        return None
+    try:
+        if page_idx >= len(pdf_doc):
+            return None
+        page = pdf_doc[page_idx]
+        scale = dpi / 72.0
+        try:
+            bitmap = page.render(scale=scale)
+            img = bitmap.to_pil()
+        except Exception:
+            return None
+        try:
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        except pytesseract.TesseractNotFoundError:
+            raise
+        except Exception:
+            return None
+    finally:
+        try:
+            pdf_doc.close()
+        except Exception:
+            pass
+
+    n = len(data.get("text", []))
+    if n == 0:
+        return None
+    inv_scale = 72.0 / dpi
+    words: list[dict] = []
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        try:
+            conf = int(data.get("conf", ["-1"])[i])
+        except (ValueError, TypeError):
+            conf = -1
+        if conf < 35:
+            continue
+        left = float(data["left"][i]) * inv_scale
+        top = float(data["top"][i]) * inv_scale
+        width = float(data["width"][i]) * inv_scale
+        height = float(data["height"][i]) * inv_scale
+        words.append({
+            "text": txt,
+            "x0": left,
+            "x1": left + width,
+            "top": top,
+            "bottom": top + height,
+        })
+    return words or None
+
+
+def _ocr_page_text(words: list[dict] | None) -> str:
+    """Reconstruct plain-text per page from OCR words (line-grouped, x-sorted)."""
+    if not words:
+        return ""
+    lines = _group_words_by_line(words, y_tol=3.0)
+    return "\n".join(" ".join(w["text"] for w in line) for line in lines)
 
 
 def _table_quality_score(tbl: list[list[str]]) -> float:
@@ -644,13 +826,18 @@ def _merge_flat_rows_from_tables(page_tables: list[list[list[str]]]) -> list[lis
 
 
 def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
-    """Extract tables with several pdfplumber strategies; single PDF open.
+    """Extract tables from every page of the uploaded PDF.
 
-    Defensive against:
-      * per-page exceptions (skip page, continue),
-      * total time budget (bail out cleanly with a useful error),
-      * very large PDFs (page cap + early-exit strategies).
-    """
+    Strategy:
+      * For pages that have extractable text, use pdfplumber + the scored
+        table/word-position pipeline.
+      * For pages that have no extractable text (scanned / image-only), fall
+        back to OCR via pytesseract + pypdfium2 and feed the OCR word boxes
+        through the same word-position transaction parser.
+
+    No artificial page cap or wall-clock budget is applied by default, so long
+    or scanned statements are processed fully. MAX_PDF_PAGES and
+    PDF_TIME_BUDGET_SECONDS env vars still work as optional safety limits."""
     import time as _time
 
     max_pages = _max_pdf_pages()
@@ -661,7 +848,11 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
     text_chunks: list[str] = []
     pages_processed = 0
     pages_with_text = 0
+    pages_ocred = 0
     timed_out = False
+    ocr_attempted = False
+    ocr_ready = False
+    tesseract_missing = False
     try:
         pdf_ctx = pdfplumber.open(io.BytesIO(content))
     except Exception as e:
@@ -671,7 +862,7 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
         )
     with pdf_ctx as pdf:
         total = len(pdf.pages)
-        for page in pdf.pages[:max_pages]:
+        for page_idx, page in enumerate(pdf.pages[:max_pages]):
             if _time.monotonic() - started > time_budget:
                 timed_out = True
                 break
@@ -679,53 +870,83 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
                 page_text = page.extract_text() or ""
             except Exception:
                 page_text = ""
-            text_chunks.append(page_text)
-            pages_processed += 1
-            # Skip image-only (scanned) pages fast: running every table strategy
-            # on 28 blank pages costs ~3 minutes and never yields a table.
             has_chars = bool(getattr(page, "chars", None))
-            if not page_text.strip() and not has_chars:
-                continue
-            pages_with_text += 1
-            try:
-                page_tables = _extract_tables_from_pdf_page(page)
-            except Exception:
-                page_tables = []
-            if not page_tables:
-                continue
-            best_tbl = max(page_tables, key=len)
-            chunk = _merge_flat_rows_from_tables([best_tbl])
+            pages_processed += 1
+
+            chunk: list[list[str]] = []
+            if page_text.strip() or has_chars:
+                pages_with_text += 1
+                text_chunks.append(page_text)
+                try:
+                    page_tables = _extract_tables_from_pdf_page(page)
+                except Exception:
+                    page_tables = []
+                if page_tables:
+                    best_tbl = max(page_tables, key=len)
+                    chunk = _merge_flat_rows_from_tables([best_tbl])
+            else:
+                # Image-only page → OCR.
+                if not ocr_attempted:
+                    ocr_attempted = True
+                    ocr_ready = _ocr_available()
+                if not ocr_ready:
+                    text_chunks.append("")
+                    continue
+                try:
+                    words = _ocr_page_words(content, page_idx)
+                except Exception as ocr_err:
+                    if pytesseract is not None and isinstance(
+                        ocr_err, pytesseract.TesseractNotFoundError
+                    ):
+                        tesseract_missing = True
+                        ocr_ready = False
+                    words = None
+                if words:
+                    pages_ocred += 1
+                    text_chunks.append(_ocr_page_text(words))
+                    reconstructed = _extract_transactions_from_words(words, y_tol=4.0)
+                    if reconstructed and len(reconstructed) >= 2:
+                        chunk = _merge_flat_rows_from_tables([reconstructed])
+                else:
+                    text_chunks.append("")
+
             if len(chunk) > 1:
                 if not all_rows:
                     all_rows.extend(chunk)
                 else:
                     h0 = all_rows[0]
-                    start = 1 if chunk and _rows_equal_as_header(chunk[0], h0) else 0
-                    all_rows.extend(chunk[start:])
+                    start_row = 1 if _rows_equal_as_header(chunk[0], h0) else 0
+                    all_rows.extend(chunk[start_row:])
+
     if len(all_rows) < 2:
-        if pages_processed > 0 and pages_with_text == 0:
+        if tesseract_missing:
             hint = (
-                f"This PDF looks scanned/image-only ({pages_processed} page(s) processed, 0 with extractable text). "
-                "Re-export the statement as a text PDF, CSV, or Excel file from your bank — "
-                "OCR is required to read scanned images and is not enabled on this server."
+                "This PDF is scanned/image-only and the Tesseract OCR binary could not be found. "
+                + _ocr_install_hint()
+            )
+        elif pages_processed > 0 and pages_with_text == 0 and not ocr_ready:
+            hint = (
+                f"This PDF looks scanned/image-only ({pages_processed} page(s), no extractable text). "
+                "OCR is not available on this server. " + _ocr_install_hint()
+            )
+        elif pages_processed > 0 and pages_with_text == 0 and pages_ocred == 0:
+            hint = (
+                f"OCR ran on {pages_processed} scanned page(s) but could not recognise any usable transaction table. "
+                "Try a higher-quality scan or export the statement as CSV/XLSX from your bank."
             )
         elif timed_out:
             hint = (
                 f"PDF processing exceeded the {int(time_budget)}s time budget after {pages_processed} page(s). "
-                "This usually means the file is large/scanned or the host is too small. "
-                "Try a CSV/XLSX export from your bank, split the PDF into smaller files, "
-                "or increase PDF_TIME_BUDGET_SECONDS / MAX_PDF_PAGES on the server."
+                "Unset PDF_TIME_BUDGET_SECONDS to run without a budget, or split the PDF."
             )
         else:
             hint = (
-                f"No usable table in the first {max_pages} page(s). Tables may start later, or this may be a scanned/image PDF."
-                if total > max_pages
-                else "No usable table found in this PDF. Scanned or image-only statements need OCR, or try CSV/Excel export from your bank."
+                "No usable transaction table found in this PDF. "
+                "If this is a text PDF, the header may not contain a recognisable 'date' column — "
+                "try a CSV/XLSX export. If it's a scan, make sure Tesseract OCR is installed. "
+                + _ocr_install_hint()
             )
-        raise HTTPException(
-            status_code=400,
-            detail=f"{hint} You can set MAX_PDF_PAGES higher on the server or upload CSV/XLSX instead.",
-        )
+        raise HTTPException(status_code=400, detail=hint)
     header = all_rows[0]
     body = all_rows[1:]
     width = len(header)

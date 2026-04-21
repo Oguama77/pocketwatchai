@@ -13,27 +13,9 @@ export function SummaryCards({ summary, currency }: SummaryCardsProps) {
     `${prefix}${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 
   const cards = [
-    {
-      title: "Total Income",
-      value: format(summary.totalIncome),
-      change: `${summary.incomeChangePct >= 0 ? "+" : ""}${summary.incomeChangePct.toFixed(1)}%`,
-      positive: summary.incomeChangePct >= 0,
-      icon: TrendingUp,
-    },
-    {
-      title: "Total Expenses",
-      value: format(summary.totalExpenses),
-      change: `${summary.expenseChangePct >= 0 ? "+" : ""}${summary.expenseChangePct.toFixed(1)}%`,
-      positive: summary.expenseChangePct <= 0,
-      icon: TrendingDown,
-    },
-    {
-      title: "Net Balance",
-      value: format(summary.netBalance),
-      change: `${summary.netBalanceChangePct >= 0 ? "+" : ""}${summary.netBalanceChangePct.toFixed(1)}%`,
-      positive: summary.netBalanceChangePct >= 0,
-      icon: Wallet,
-    },
+    { title: "Total Income", value: format(summary.totalIncome), icon: TrendingUp },
+    { title: "Total Expenses", value: format(summary.totalExpenses), icon: TrendingDown },
+    { title: "Net Balance", value: format(summary.netBalance), icon: Wallet },
   ];
 
   return (
@@ -52,9 +34,6 @@ export function SummaryCards({ summary, currency }: SummaryCardsProps) {
               </div>
             </div>
             <p className="text-2xl font-bold">{card.value}</p>
-            <p className={`text-sm mt-1 ${card.positive ? "text-primary" : "text-destructive"}`}>
-              {card.change} from last month
-            </p>
           </CardContent>
         </Card>
       ))}

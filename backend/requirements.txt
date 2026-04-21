@@ -10,3 +10,6 @@ langchain-openai
 langchain-community
 duckduckgo-search
 ddgs
+pytesseract
+Pillow
+pypdfium2
