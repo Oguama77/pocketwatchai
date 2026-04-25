@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -14,13 +14,15 @@ export default function Signup() {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const navigate = useNavigate();
+  const location = useLocation();
   const { setAuthenticated } = useAppStore();
 
   const handleSignup = (e: React.FormEvent) => {
     e.preventDefault();
     saveUserProfileFromSignup(name, email);
     setAuthenticated(true);
-    navigate("/");
+    const from = (location.state as { from?: { pathname?: string } } | null)?.from?.pathname;
+    navigate(from && from !== "/login" && from !== "/signup" ? from : "/", { replace: true });
   };
 
   return (

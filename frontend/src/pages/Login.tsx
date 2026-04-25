@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -12,13 +12,19 @@ export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const navigate = useNavigate();
+  const location = useLocation();
   const { setAuthenticated } = useAppStore();
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     saveUserProfileFromLogin(email);
     setAuthenticated(true);
-    navigate("/");
+    // ProtectedRoute parks the originally-requested location in
+    // location.state.from when it bounces an anonymous visitor here, so we
+    // can drop them back where they were heading instead of dumping every
+    // login on the dashboard.
+    const from = (location.state as { from?: { pathname?: string } } | null)?.from?.pathname;
+    navigate(from && from !== "/login" && from !== "/signup" ? from : "/", { replace: true });
   };
 
   return (

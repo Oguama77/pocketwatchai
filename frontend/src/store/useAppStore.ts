@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { Conversation, Message } from "@/types/chat";
+import { loadUserProfile } from "@/lib/userProfile";
 
 interface AppState {
   conversations: Conversation[];
@@ -25,6 +26,21 @@ const toDate = (value: unknown): Date => {
   return isNaN(d.getTime()) ? new Date() : d;
 };
 
+// Derive initial auth state from the persisted profile blob in localStorage.
+// We treat the existence of a saved profile as proof of a prior login (the
+// only way it gets written is `saveUserProfileFromLogin` / `…FromSignup`,
+// both of which run only on a successful submit). This keeps refreshes and
+// direct deep-links from bouncing a logged-in user back to /login while
+// still defaulting brand-new visitors to unauthenticated.
+const isInitiallyAuthenticated = (): boolean => {
+  if (typeof window === "undefined") return false;
+  try {
+    return loadUserProfile() !== null;
+  } catch {
+    return false;
+  }
+};
+
 const reviveConversations = (raw: unknown): Conversation[] => {
   if (!Array.isArray(raw)) return [];
   return raw.map((c) => {
@@ -46,7 +62,7 @@ export const useAppStore = create<AppState>()(
       conversations: [],
       activeConversationId: null,
       sidebarOpen: true,
-      isAuthenticated: true,
+      isAuthenticated: isInitiallyAuthenticated(),
 
       setAuthenticated: (auth) => set({ isAuthenticated: auth }),
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
