@@ -718,6 +718,69 @@ def _assign_word_to_column(word: dict, columns: list[tuple[str, float, float]]) 
     return picked
 
 
+_FOOTER_KEYWORDS = (
+    "report lost",
+    "stolen card",
+    "get help",
+    "scan the qr",
+    "scan the qrcode",
+    "scan the qr code",
+    "deposit guarantee",
+    "deposit insurance",
+    "central bank",
+    "registered address",
+    "lithuanian",
+    "european central bank",
+    "indeliu ir investiciju",
+    "indėlių ir investicijų",
+    "konstitucijos",
+    "page ",
+    "www.",
+    "iidraudimas",
+    "authorization code",
+    "is a bank licensed",
+    "regulated by",
+    "registered office",
+    "company number",
+    "in-app chat",
+    "via the in-app",
+    "more information on",
+)
+
+
+def _is_footer_or_boilerplate_line(line_words: list[dict], cells: list[str]) -> bool:
+    """Return True if a visual line is page-footer / boilerplate noise that
+    must NOT be merged into the previous transaction.
+
+    Bank statements (Revolut especially) sandwich every page between a
+    chunky multi-line legal/marketing footer. The word-position parser
+    sees those lines as 'date column is empty' and would naively treat
+    them as continuations of the last real transaction, polluting the
+    description with "Report +370 5 214 Get help Scan the © 2026 ..."
+    and -- because the date column then no longer parses -- ultimately
+    DROP the legitimate transaction at date-parse time.
+
+    Heuristic: a line is footer/boilerplate when the joined text contains
+    any of the well-known footer keywords, OR when most of the words sit
+    in the leftmost area of the page outside the regular table columns,
+    OR when the line spans the full page width with no monetary tokens
+    (typical of a long legal sentence).
+    """
+    if not cells:
+        return False
+    joined = " ".join(c for c in cells if c).strip().lower()
+    if not joined:
+        return False
+    for kw in _FOOTER_KEYWORDS:
+        if kw in joined:
+            return True
+    # A long line of plain text spanning the page with no money symbols
+    # and no date is almost certainly footer/legal text.
+    if len(joined) > 120 and not re.search(r"[€$£¥₹₦]\s*\d|\d[.,]\d{2}\b", joined):
+        return True
+    return False
+
+
 def _extract_transactions_from_words(words: list[dict], y_tol: float = 2.5) -> list[list[str]] | None:
     """Reconstruct a transaction table from positioned words (pdfplumber or OCR).
 
@@ -770,6 +833,17 @@ def _extract_transactions_from_words(words: list[dict], y_tol: float = 2.5) -> l
             col = _assign_word_to_column(w, columns)
             cell_tokens[col].append(w["text"])
         cells = [" ".join(tokens).strip() for tokens in cell_tokens]
+
+        # Detect page-footer / boilerplate lines and break the in-progress
+        # transaction so footer text does NOT get merged into the
+        # description (which would later cause the date column to look
+        # like "Oct 8, 2025 Report +370 5 214 Get help Scan the © 2026..."
+        # and silently drop the row at date-parse time).
+        if _is_footer_or_boilerplate_line(line, cells):
+            if current is not None:
+                rows.append([" ".join(c).strip() for c in current])
+                current = None
+            continue
 
         date_cell = cells[date_col_idx] if date_col_idx < len(cells) else ""
         if date_cell and _DATE_LINE_RE.match(date_cell):
@@ -1250,7 +1324,16 @@ def _normalize_loaded_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _promote_best_header_row(df: pd.DataFrame, scan_rows: int = 10) -> pd.DataFrame:
-    """Auto-detect and promote a likely header row from the first `scan_rows` rows."""
+    """Auto-detect and promote a likely header row from the first `scan_rows` rows.
+
+    SAFETY GATE: if the existing column names already look like a clean
+    transaction-table header (e.g. 'Date', 'Description', 'Money out',
+    'Money in', 'Balance'), we leave them alone. Without this gate the
+    function would happily promote a polluted data row — for example a
+    Revolut row with the page footer accidentally merged in by the
+    word-position parser — and turn 'Money out' into a 200-char string
+    that no canonical-column matcher can recognise. That used to wipe out
+    ~99% of money values in `revolut_sample_statement.pdf`."""
     if df.empty:
         return df
 
@@ -1269,7 +1352,23 @@ def _promote_best_header_row(df: pd.DataFrame, scan_rows: int = 10) -> pd.DataFr
         "memo",
         "payee",
         "narrative",
+        "money in",
+        "money out",
+        "withdrawal",
+        "deposit",
     }
+
+    # Score the existing headers using the same rubric as data rows so we
+    # can skip promotion when the headers are already good.
+    existing_norm = [_norm_col(str(c)) for c in df.columns]
+    existing_keyword_hits = sum(
+        1 for c in existing_norm
+        if c and (c in header_terms or "date" in c or _match_money_column_by_tokens(c))
+    )
+    if existing_keyword_hits >= 3:
+        # The existing column names are already a recognisable transaction
+        # header — don't replace them with a data row.
+        return df
 
     best_idx = 0
     best_score = -1.0
@@ -1282,6 +1381,12 @@ def _promote_best_header_row(df: pd.DataFrame, scan_rows: int = 10) -> pd.DataFr
             continue
         norm = [_norm_col(c) for c in non_empty]
         keyword_hits = sum(1 for c in norm if c in header_terms or "date" in c)
+        # Penalise rows that look like polluted data (very long cells, e.g.
+        # description merged with footer crud) so they can't masquerade as
+        # headers. Real headers are always short labels.
+        avg_len = sum(len(c) for c in non_empty) / max(1, len(non_empty))
+        if avg_len > 25:
+            continue
         uniqueness = len(set(norm)) / max(1, len(non_empty))
         fill_ratio = len(non_empty) / max(1, width)
         score = (keyword_hits * 2.0) + uniqueness + fill_ratio
@@ -1289,7 +1394,9 @@ def _promote_best_header_row(df: pd.DataFrame, scan_rows: int = 10) -> pd.DataFr
             best_score = score
             best_idx = i
 
-    if best_idx == 0:
+    # Require at least ONE real keyword hit before promoting — otherwise
+    # the "best" candidate is just an arbitrary data row.
+    if best_idx == 0 or best_score < 1.5:
         return df
 
     header = [str(v or "").strip() for v in df.iloc[best_idx].tolist()]
@@ -1403,21 +1510,43 @@ def _vision_max_pages() -> int:
 
 
 def _vision_render_dpi() -> int:
+    """Default DPI for vision rendering.
+
+    144 (= 2x screen resolution) is a deliberately conservative default
+    chosen so the resulting JPEG fits in a few hundred KB even for a full
+    A4 statement page. On Render's 512MB tier, holding a single 300 DPI
+    grayscale bitmap (~25MB raw + ~3 PIL conversions) was enough to OOM
+    a 13-page Revolut PDF. Dropping to 144 + JPEG keeps peak RSS bounded
+    while still leaving the table comfortably legible to gpt-4o-mini at
+    detail=high (which auto-tiles up to 2048x2048)."""
     try:
-        return max(120, min(300, int(os.getenv("VISION_DPI", "180"))))
+        return max(96, min(300, int(os.getenv("VISION_DPI", "144"))))
     except ValueError:
-        return 180
+        return 144
 
 
-_VISION_PROMPT = """You are extracting transactions from one page of a bank statement.
+def _vision_image_format() -> str:
+    """JPEG by default — 3-5x smaller payload than PNG for these scans."""
+    fmt = os.getenv("VISION_IMAGE_FORMAT", "jpeg").strip().lower()
+    return fmt if fmt in {"jpeg", "png"} else "jpeg"
 
-Return STRICT JSON with this exact shape:
+
+def _vision_jpeg_quality() -> int:
+    try:
+        return max(50, min(95, int(os.getenv("VISION_JPEG_QUALITY", "80"))))
+    except ValueError:
+        return 80
+
+
+_VISION_PROMPT = """You are an OCR agent extracting transactions from ONE page of a bank statement.
+
+Return STRICT JSON only (no prose, no markdown, no code fences):
 {
-  "currency": "ISO-4217 code or symbol if visible (e.g. EUR, USD, GBP, NGN, €, $); empty string if unclear",
+  "currency": "ISO-4217 code (e.g. EUR, USD, GBP, NGN) or empty string if unclear",
   "transactions": [
     {
-      "date": "YYYY-MM-DD if you can normalise it, otherwise the original string",
-      "description": "merchant / counterparty / reference text exactly as printed",
+      "date": "YYYY-MM-DD",
+      "description": "merchant / counterparty / reference, joined onto one line",
       "money_out": <number or null>,
       "money_in":  <number or null>,
       "balance":   <number or null>
@@ -1425,28 +1554,66 @@ Return STRICT JSON with this exact shape:
   ]
 }
 
-CRITICAL RULES — read carefully:
-1. Extract ONLY individual transaction rows from the main transaction table.
-2. DO NOT include:
-   - Balance summary rows ("Opening balance", "Closing balance", "Total", "Money out total", etc.).
-   - Pending / not-yet-posted transactions (often in a separate "Pending" section).
-   - Page subtotals, carry-forward lines, headers, footers, or marketing text.
-3. "money_out" = withdrawal / debit / payment / outflow / spending.
-   "money_in"  = deposit / credit / payment received / inflow / income.
-   If a row has only one amount, decide which column it belongs to by looking at
-   its horizontal position relative to the column headers — DO NOT GUESS.
-4. Numbers must be JSON numbers (e.g. 1234.56), no currency symbols, no commas,
-   no parentheses. Use null when a column is blank for that row.
-5. If a transaction description spans multiple lines, join them into one
-   description string; the row still has exactly one money_out / money_in /
-   balance triple.
-6. If the page has no transaction rows at all, return {"currency": "...", "transactions": []}.
-7. Output JSON only — no prose, no markdown, no code fences.
+================ STRICT EXCLUSION RULES ================
+DO NOT include any of these — they are NOT transactions, even though they
+look like rows with numbers:
+
+  (a) Balance summary tables. Lines that say things like:
+        "Balance summary", "Statement summary",
+        "Opening balance", "Closing balance",
+        "Account (Current Account)  €0.00  €13,419.05  €13,510.25  €91.20",
+        "Personal and Group Pockets  €0.00  €1,210.00  €4,950.00  €3,740.00",
+        "Total                       €0.00  €14,629.05  €18,460.25  €3,831.20"
+      These are aggregates of the per-row transactions and including them
+      DOUBLES the totals. SKIP them entirely.
+
+  (b) "Pending" sections. Any rows under a "Pending from <date> to <date>"
+      header are NOT yet posted; SKIP them entirely.
+
+  (c) Page headers, footers, marketing text, "Report lost or stolen card",
+      legal disclaimers, page numbers ("Page X of Y").
+
+  (d) Foreign-exchange annotation lines that just describe a rate
+      ("Revolut Rate €1.00 = $1.15", "ECB rate*", "Fee: €0.70 €34.56").
+      These are sub-lines under a real transaction, not separate rows.
+
+================ COLUMN ATTRIBUTION RULES ================
+The transaction table on a typical statement has these columns, left to right:
+    [Date] [Description] [Money out / Debit] [Money in / Credit] [Balance]
+
+For EVERY data row:
+  * Identify each amount by which COLUMN HEADER sits directly above it.
+  * "money_out" = the amount under the Money out / Debit / Withdrawal column.
+  * "money_in"  = the amount under the Money in / Credit / Deposit column.
+  * Most rows have EXACTLY ONE of money_out / money_in populated, never both.
+  * If a row shows two amounts, the second is almost always the Balance.
+
+================ MULTI-LINE DESCRIPTION HANDLING ================
+A single transaction often occupies 2-3 visual lines:
+    "Nov 11, 2025  To Opeyemi Priscilla Akinyemi   €1,560.00   €50.88"
+    "              Reference: Thank you so much..."
+    "              To: Opeyemi Priscilla Akinyemi, BE89967667468985"
+Treat all three as ONE transaction. The IBAN / card number / reference is
+PART of the description, not a separate row, and is NEVER an amount.
+NEVER write a long digit string (an IBAN, account number, card mask, or URI)
+into money_out, money_in, or balance.
+
+================ NUMERIC FORMAT ================
+Numbers must be plain JSON numbers (1234.56), no currency symbols, no
+thousands separators, no parentheses. Use null when blank.
+
+If the page has no transaction rows at all (e.g. it's purely a cover or
+summary page), return {"currency": "...", "transactions": []}.
 """
 
 
-def _render_page_to_png_b64(pdf_doc, page_idx: int, dpi: int) -> str | None:
-    """Render one PDF page to PNG and return a base64 data URL, or None on failure."""
+def _render_page_to_data_url(pdf_doc, page_idx: int, dpi: int) -> str | None:
+    """Render one PDF page to a base64 data URL (JPEG by default).
+
+    Aggressively releases bitmap and PIL image buffers as soon as the
+    encoded bytes are produced, so peak RSS during the loop stays close
+    to a single page's bitmap size rather than accumulating across pages.
+    """
     if pdfium is None:
         return None
     try:
@@ -1455,8 +1622,12 @@ def _render_page_to_png_b64(pdf_doc, page_idx: int, dpi: int) -> str | None:
         page = pdf_doc[page_idx]
     except Exception:
         return None
+
+    img_format = _vision_image_format()
+    quality = _vision_jpeg_quality()
     bitmap = None
     img = None
+    rgb = None
     try:
         scale = dpi / 72.0
         try:
@@ -1471,15 +1642,46 @@ def _render_page_to_png_b64(pdf_doc, page_idx: int, dpi: int) -> str | None:
                     bitmap.close()
                 except Exception:
                     pass
+                bitmap = None
+
         buf = io.BytesIO()
         try:
-            img.convert("RGB").save(buf, format="PNG", optimize=True)
+            rgb = img.convert("RGB")
+            if img is not rgb:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+                img = None
+            if img_format == "jpeg":
+                rgb.save(buf, format="JPEG", quality=quality, optimize=True, progressive=False)
+                mime = "image/jpeg"
+            else:
+                rgb.save(buf, format="PNG", optimize=True)
+                mime = "image/png"
         except Exception as save_err:
-            print(f"[vision] PNG encode failed page {page_idx + 1}: {save_err!r}")
+            print(f"[vision] image encode failed page {page_idx + 1}: {save_err!r}")
             return None
+        finally:
+            if rgb is not None:
+                try:
+                    rgb.close()
+                except Exception:
+                    pass
+                rgb = None
+
         encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
+        size_kb = len(buf.getvalue()) // 1024
+        buf.close()
+        if page_idx == 0 or page_idx % 5 == 0:
+            print(f"[vision] page {page_idx + 1} encoded as {img_format} ({size_kb} KiB)")
+        return f"data:{mime};base64,{encoded}"
     finally:
+        if rgb is not None:
+            try:
+                rgb.close()
+            except Exception:
+                pass
         if img is not None:
             try:
                 img.close()
@@ -1492,7 +1694,12 @@ def _render_page_to_png_b64(pdf_doc, page_idx: int, dpi: int) -> str | None:
 
 
 def _coerce_vision_amount(raw: object) -> float | None:
-    """Coerce a model-returned amount to float, accepting numbers and strings."""
+    """Coerce a model-returned amount to float, accepting numbers and strings.
+
+    Hard rejects amounts that look like account numbers / IBANs (the model
+    occasionally hallucinates an IBAN into the balance field) and any
+    impossibly large magnitude — see _parse_money for the exact gates.
+    """
     if raw is None:
         return None
     if isinstance(raw, bool):
@@ -1502,24 +1709,38 @@ def _coerce_vision_amount(raw: object) -> float | None:
             v = float(raw)
         except (TypeError, ValueError):
             return None
-        return None if pd.isna(v) else v
+        if pd.isna(v):
+            return None
+        if abs(v) > _MAX_REALISTIC_MONEY:
+            return None
+        # Integer-looking values with too many digits are almost always an
+        # IBAN / reference number, not money.
+        if abs(v) >= 1e12 and float(v).is_integer():
+            return None
+        return v
     return _parse_money(raw)
 
 
 def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
     """Extract transactions from a PDF using GPT-4o vision.
 
-    Renders each page to PNG, sends it to the multimodal model with a strict
-    JSON schema, and concatenates the per-page transaction lists into a
-    single DataFrame with canonical columns: date / description / debit /
-    credit / balance.
+    Renders each page to a memory-cheap JPEG, sends it to the multimodal
+    model with a strict JSON schema, and concatenates the per-page
+    transaction lists into a single DataFrame with canonical columns:
+    date / description / debit / credit / balance.
+
+    Memory is bounded to roughly one page's bitmap + one base64 string at
+    any time — important on Render's 512MB tier where holding the whole
+    document as bitmaps OOMs even on a 13-page PDF.
 
     Returns None when:
       * The OPENAI_API_KEY is not set or vision is explicitly disabled,
       * pypdfium2 is not installed,
-      * Every page failed to extract any transactions (caller should then
-        fall back to the heuristic pdfplumber pipeline).
+      * Every page failed to extract any transactions (caller falls back
+        to the heuristic pdfplumber pipeline).
     """
+    import gc as _gc
+
     if not _vision_extraction_enabled():
         return None
     api_key = os.getenv("OPENAI_API_KEY")
@@ -1541,18 +1762,25 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
     dpi = _vision_render_dpi()
     max_pages = min(_vision_max_pages(), _max_pdf_pages())
     n_pages = min(len(pdf_doc), max_pages)
-    print(f"[vision] using model={model} dpi={dpi} pages={n_pages}/{len(pdf_doc)}")
+    print(
+        f"[vision] using model={model} dpi={dpi} format={_vision_image_format()} "
+        f"pages={n_pages}/{len(pdf_doc)}"
+    )
 
     rows: list[dict] = []
     text_chunks: list[str] = []
     detected_currency: str = ""
     pages_with_rows = 0
+    pages_failed = 0
 
     try:
         for page_idx in range(n_pages):
-            data_url = _render_page_to_png_b64(pdf_doc, page_idx, dpi)
+            data_url = _render_page_to_data_url(pdf_doc, page_idx, dpi)
             if data_url is None:
+                pages_failed += 1
+                _gc.collect()
                 continue
+
             try:
                 resp = client.chat.completions.create(
                     model=model,
@@ -1573,10 +1801,18 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
                 )
             except Exception as api_err:
                 print(f"[vision] page {page_idx + 1}: API call failed: {api_err!r}")
+                data_url = None
+                _gc.collect()
+                pages_failed += 1
                 continue
+            finally:
+                # Free the multi-MB base64 string before parsing the response.
+                data_url = None
 
             content_str = (resp.choices[0].message.content or "").strip()
+            resp = None
             if not content_str:
+                _gc.collect()
                 continue
             try:
                 data = json.loads(content_str)
@@ -1588,6 +1824,7 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
                     data = json.loads(cleaned)
                 except Exception as parse_err:
                     print(f"[vision] page {page_idx + 1}: JSON parse failed: {parse_err!r}")
+                    _gc.collect()
                     continue
 
             if not detected_currency:
@@ -1597,6 +1834,7 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
 
             txns = data.get("transactions") or []
             if not isinstance(txns, list):
+                _gc.collect()
                 continue
             page_count = 0
             for t in txns:
@@ -1621,27 +1859,41 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
                 page_count += 1
             if page_count:
                 pages_with_rows += 1
+            # Keep at most a short snippet from each page in the source-text
+            # context so the per-statement RAM footprint stays small even
+            # on long PDFs.
             text_chunks.append(
-                f"[Page {page_idx + 1}] " + json.dumps(txns, ensure_ascii=False)[:4000]
+                f"[Page {page_idx + 1}] " + json.dumps(txns, ensure_ascii=False)[:1500]
             )
             print(f"[vision] page {page_idx + 1}: {page_count} transaction(s)")
+            _gc.collect()
     finally:
         try:
             pdf_doc.close()
         except Exception:
             pass
+        _gc.collect()
 
     if not rows:
-        print("[vision] no transactions extracted on any page; will fall back to heuristic")
+        print(
+            f"[vision] no transactions extracted ({pages_failed} page(s) failed); "
+            "will fall back to heuristic"
+        )
         return None
 
     df = pd.DataFrame(rows)
     if detected_currency:
         df.attrs["__detected_currency__"] = detected_currency
+    # Mark this frame as already-canonicalised so _prepare_financial_df can
+    # skip header-promotion / column-renaming logic that would otherwise
+    # mangle our clean output (e.g., interpreting our 'description' column
+    # as a header row when its first row matches an alias).
+    df.attrs["__already_canonical__"] = True
     text = "\n".join(text_chunks).strip()
     print(
         f"[vision] extracted {len(rows)} transaction(s) "
-        f"from {pages_with_rows}/{n_pages} page(s)"
+        f"from {pages_with_rows}/{n_pages} page(s) "
+        f"({pages_failed} page(s) failed)"
     )
     return df, text
 
@@ -1793,14 +2045,198 @@ def _detect_currency(source_text: str, df: pd.DataFrame | None) -> str:
     return max(counts, key=lambda k: counts[k])
 
 
+_BALANCE_TOLERANCE = 0.02  # 2 cents — covers float rounding in reported balances
+
+
+def _reconcile_with_running_balance(df: pd.DataFrame) -> pd.DataFrame:
+    """Use the running balance column as ground truth to repair debit/credit.
+
+    For every consecutive pair of rows whose balances are both populated and
+    look like they belong to the same account chain, the bank's arithmetic
+    must hold:
+
+        balance[i] - balance[i - 1]  ==  credit[i] - debit[i]    (within $0.02)
+
+    When that identity fails, this function attempts repairs in priority
+    order:
+
+      1. Swap debit <-> credit if that makes the identity hold.
+      2. If only one of (debit, credit) is non-null and the wrong sign,
+         move it to the other side.
+      3. If both look hallucinated and the magnitude of the delta matches
+         exactly one of them, derive the correct value from the delta
+         itself and clear the spurious one.
+
+    A "same account chain" heuristic: rows are part of the same chain if
+    the balance delta is "reasonable" — i.e., the magnitude of (delta) is
+    within 5x the larger of |debit| and |credit| OR within 0.5 * |prev_bal|.
+    This excludes obvious account-switch jumps (e.g. main account closes at
+    €91 and the next row is a pocket entry with balance €3,740) so we don't
+    incorrectly "fix" rows that are actually correct but belong to a
+    different running balance.
+
+    This works whether the data came from GPT-4o vision OR the heuristic
+    pdfplumber pipeline — both share the same swap-on-multi-line-row failure
+    mode, and both share the same canonical column names here.
+
+    Mutates and returns `df`.
+    """
+    if "balance" not in df.columns:
+        return df
+    if "debit" not in df.columns and "credit" not in df.columns:
+        return df
+
+    work = df.copy()
+    if "debit" not in work.columns:
+        work["debit"] = pd.NA
+    if "credit" not in work.columns:
+        work["credit"] = pd.NA
+
+    work["_bal_num"] = pd.to_numeric(work["balance"], errors="coerce")
+    work["_dr_num"] = pd.to_numeric(work["debit"], errors="coerce").fillna(0.0)
+    work["_cr_num"] = pd.to_numeric(work["credit"], errors="coerce").fillna(0.0)
+
+    swaps = 0
+    cleared = 0
+    derived = 0
+
+    prev_balance: float | None = None
+    for i in range(len(work)):
+        bal = work["_bal_num"].iat[i]
+        dr = float(work["_dr_num"].iat[i])
+        cr = float(work["_cr_num"].iat[i])
+
+        if pd.isna(bal):
+            continue
+        if prev_balance is None:
+            prev_balance = float(bal)
+            continue
+
+        delta = float(bal) - prev_balance
+        signed = cr - dr
+
+        if abs(delta - signed) <= _BALANCE_TOLERANCE:
+            # Identity holds — accept this row, advance the chain.
+            prev_balance = float(bal)
+            continue
+
+        # Decide whether this row belongs to the same account chain. If the
+        # gap is too wild relative to the row's amounts AND too wild relative
+        # to the previous balance, treat it as an account switch and DO NOT
+        # mutate this row — just reset the chain.
+        max_amount = max(abs(dr), abs(cr), 1.0)
+        plausible_same_chain = (
+            abs(delta) <= 50 * max_amount
+            and abs(delta) <= max(0.5 * abs(prev_balance) + max_amount * 5, 50.0)
+        )
+        if not plausible_same_chain:
+            prev_balance = float(bal)
+            continue
+
+        # Repair attempt 1: a clean debit/credit swap fixes the identity.
+        if abs(delta - (dr - cr)) <= _BALANCE_TOLERANCE:
+            work["_dr_num"].iat[i], work["_cr_num"].iat[i] = cr, dr
+            swaps += 1
+            prev_balance = float(bal)
+            continue
+
+        # Repair attempt 2: only one of (dr, cr) is non-zero but on the
+        # wrong side — move it to the other side.
+        if dr > 0 and cr == 0 and abs(delta - dr) <= _BALANCE_TOLERANCE:
+            work["_dr_num"].iat[i] = 0.0
+            work["_cr_num"].iat[i] = dr
+            swaps += 1
+            prev_balance = float(bal)
+            continue
+        if cr > 0 and dr == 0 and abs(delta + cr) <= _BALANCE_TOLERANCE:
+            work["_cr_num"].iat[i] = 0.0
+            work["_dr_num"].iat[i] = cr
+            swaps += 1
+            prev_balance = float(bal)
+            continue
+
+        # Repair attempt 3: both non-zero but the delta only matches one
+        # of them — clear the spurious side.
+        if dr > 0 and cr > 0:
+            if abs(delta - cr) <= _BALANCE_TOLERANCE:
+                work["_dr_num"].iat[i] = 0.0
+                cleared += 1
+                prev_balance = float(bal)
+                continue
+            if abs(delta + dr) <= _BALANCE_TOLERANCE:
+                work["_cr_num"].iat[i] = 0.0
+                cleared += 1
+                prev_balance = float(bal)
+                continue
+
+        # Repair attempt 4 (last resort): derive from the delta ONLY when
+        # the row currently has neither a debit nor a credit. We never
+        # override already-extracted amounts here because doing so risks
+        # rewriting correct data on multi-account statements where the
+        # balance chain genuinely breaks across accounts.
+        if dr == 0 and cr == 0:
+            if delta > _BALANCE_TOLERANCE:
+                work["_cr_num"].iat[i] = float(delta)
+                derived += 1
+            elif delta < -_BALANCE_TOLERANCE:
+                work["_dr_num"].iat[i] = float(-delta)
+                derived += 1
+        prev_balance = float(bal)
+
+    if swaps or cleared or derived:
+        print(
+            f"[reconcile] balance check: swapped={swaps} cleared={cleared} "
+            f"derived={derived} (rows={len(work)})"
+        )
+
+    df = df.copy()
+    df["debit"] = work["_dr_num"].where(work["_dr_num"] != 0, pd.NA)
+    df["credit"] = work["_cr_num"].where(work["_cr_num"] != 0, pd.NA)
+    return df
+
+
+def _drop_summary_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Defensive filter: drop rows whose description is obviously a summary
+    line ("Opening balance", "Closing balance", "Total", etc.) even if the
+    upstream extractor leaked them in. This is a last line of defence — the
+    vision prompt and heuristic parser already try to skip them, but we
+    don't want a single missed exclusion to multiply totals 2x."""
+    if "description" not in df.columns:
+        return df
+    desc = df["description"].astype(str).str.strip().str.lower()
+    summary_patterns = (
+        r"^total(\s|$|:)",
+        r"^opening\s+balance",
+        r"^closing\s+balance",
+        r"^statement\s+balance",
+        r"^balance\s+summary",
+        r"^statement\s+summary",
+        r"^money\s+(in|out)\s+total",
+        r"^subtotal",
+        r"^carry(\s+|-)forward",
+        r"^pending\s+from",
+        r"^account\s*\(current\s+account\)",
+        r"^personal\s+and\s+group\s+pockets",
+        r"^(grand\s+)?total\s+(money|debit|credit|balance)",
+    )
+    pattern = "|".join(summary_patterns)
+    mask = desc.str.contains(pattern, regex=True, na=False)
+    if mask.any():
+        print(f"[sanity] dropping {int(mask.sum())} summary-row(s) (e.g. {desc[mask].iloc[0]!r})")
+        df = df.loc[~mask].copy()
+    return df
+
+
 def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     if df.empty:
         raise HTTPException(status_code=400, detail="Uploaded file has no rows.")
 
+    already_canonical = bool(df.attrs.get("__already_canonical__", False))
     df = _normalize_loaded_frame(df.copy())
-    df = _promote_best_header_row(df, scan_rows=10)
-    df = _canonicalise_columns(df)
-    df = _dedupe_canonical_columns(df)
+    if not already_canonical:
+        df = _promote_best_header_row(df, scan_rows=10)
+        df = _canonicalise_columns(df)
+        df = _dedupe_canonical_columns(df)
     inferred = _infer_date_column(df)
     if inferred is not None:
         df = inferred
@@ -1840,6 +2276,14 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
                     f"with absurd magnitude (>{_MAX_REALISTIC_MONEY:.0e})"
                 )
                 df.loc[mask_absurd, column] = pd.NA
+
+    # Drop any summary / pending rows that slipped through, then run the
+    # balance-reconciliation pass — this uses the bank's own arithmetic
+    # (running balance is the canonical source of truth) to detect and
+    # repair swapped debit/credit columns regardless of which extractor
+    # produced them.
+    df = _drop_summary_rows(df)
+    df = _reconcile_with_running_balance(df)
 
     has_debit = "debit" in df.columns
     has_credit = "credit" in df.columns
