@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAppStore } from "@/store/useAppStore";
 import { saveUserProfileFromSignup } from "@/lib/userProfile";
+import { LogoMark } from "@/components/Logo";
 
 export default function Signup() {
   const [name, setName] = useState("");
@@ -26,9 +27,7 @@ export default function Signup() {
     <div className="min-h-screen flex items-center justify-center bg-muted p-4">
       <Card className="w-full max-w-md shadow-card animate-fade-in">
         <CardHeader className="text-center pb-2 pt-8">
-          <div className="w-12 h-12 rounded-xl bg-primary flex items-center justify-center mx-auto mb-4">
-            <span className="text-primary-foreground font-bold text-lg">P</span>
-          </div>
+          <LogoMark size="lg" className="mx-auto mb-4" />
           <h1 className="text-2xl font-bold">Create your account</h1>
           <p className="text-sm text-muted-foreground">Get started with PocketWatch</p>
         </CardHeader>

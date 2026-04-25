@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { LogoMark } from "@/components/Logo";
 
 export function AppSidebar() {
   const navigate = useNavigate();
@@ -36,9 +37,7 @@ export function AppSidebar() {
       {/* Header */}
       <div className="p-4 border-b border-sidebar-border">
         <div className="flex items-center gap-2 mb-4">
-          <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-            <span className="text-primary-foreground font-bold text-sm">P</span>
-          </div>
+          <LogoMark size="sm" />
           <span className="font-semibold text-sidebar-foreground text-lg">PocketWatch</span>
         </div>
         <Button

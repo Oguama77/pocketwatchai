@@ -14,13 +14,30 @@ import { clearUserProfile, getUserInitials } from "@/lib/userProfile";
 
 export function TopNav() {
   const { toggleSidebar, setAuthenticated } = useAppStore();
+  const isAuthenticated = useAppStore((s) => s.isAuthenticated);
   const navigate = useNavigate();
   const location = useLocation();
   const [initials, setInitials] = useState(() => getUserInitials());
 
+  // Refresh on route change AND on auth-state change so the avatar in the
+  // top right reflects the freshly-logged-in user's initials immediately
+  // (before this dependency, signing in on /login → navigating to / picked
+  // up the new initials only because the route changed; toggling auth on
+  // an already-mounted layout left a stale avatar). Cross-tab updates from
+  // a `storage` event also force a refresh.
   useEffect(() => {
     setInitials(getUserInitials());
-  }, [location.pathname]);
+  }, [location.pathname, isAuthenticated]);
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === "pocketwatch_user_profile" || e.key === null) {
+        setInitials(getUserInitials());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   const pageTitle = location.pathname === "/chat" ? "Chat" : "Dashboard";
 
