@@ -619,6 +619,41 @@ _DATE_LINE_RE = re.compile(
     re.I,
 )
 
+_LEADING_DATE_RE = re.compile(
+    r"^\s*("
+    rf"(?:{_MONTH_PATTERN})\s+\d{{1,2}},?\s+\d{{2,4}}|"
+    rf"\d{{1,2}}[\s\-/\.](?:{_MONTH_PATTERN})[\s\-/\.]\d{{2,4}}|"
+    r"\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}|"
+    r"\d{4}[\-/\.]\d{1,2}[\-/\.]\d{1,2}"
+    r")",
+    re.I,
+)
+
+
+def _extract_leading_date(value: object) -> object:
+    """Pull just the leading date pattern out of a possibly-polluted date cell.
+
+    Word-position parsers occasionally merge the next visual line's text into
+    the date column when y-tolerances overlap, producing cells like
+    "31-JAN-23 END OF STATEMENT" or "Mar 27, 2026 Page 6 of 14". Without
+    this normalisation, pd.to_datetime returns NaT on those cells and the
+    entire transaction (potentially thousands of dollars) silently vanishes.
+
+    Returns the matched date substring, or the original value when no date
+    pattern is present (so already-parsed datetimes pass through untouched).
+    """
+    if value is None:
+        return value
+    if isinstance(value, (pd.Timestamp,)) or hasattr(value, "year"):
+        return value
+    s = str(value).strip()
+    if not s:
+        return value
+    m = _LEADING_DATE_RE.match(s)
+    if m:
+        return m.group(1)
+    return value
+
 
 def _is_date_header_token(token: str) -> bool:
     return token == "date" or token.endswith("date") or token.startswith("date")
@@ -745,6 +780,17 @@ _FOOTER_KEYWORDS = (
     "in-app chat",
     "via the in-app",
     "more information on",
+    # FirstBank Nigeria style footers / disclaimers
+    "end of statement",
+    "end of report",
+    "disclaimer",
+    "the information transmitted",
+    "intended recipient",
+    "review, retransmission",
+    "strictly prohibited",
+    "caution:",
+    "do not reveal",
+    "fraudulent",
 )
 
 
@@ -1033,7 +1079,40 @@ def _ocr_page_text(words: list[dict] | None) -> str:
     return "\n".join(" ".join(w["text"] for w in line) for line in lines)
 
 
-def _table_quality_score(tbl: list[list[str]]) -> float:
+_MONEY_CELL_RE = re.compile(r"[€$£¥₹₦]\s*-?\d|-?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|-?\d+[.,]\d{2}")
+
+
+def _row_has_money(row: list[str]) -> bool:
+    """True if any cell in the row looks like a monetary amount."""
+    for c in row:
+        s = str(c or "").strip()
+        if s and _MONEY_CELL_RE.search(s):
+            return True
+    return False
+
+
+def _row_is_meaningful(row: list[str]) -> bool:
+    """True if the row looks like a real transaction line, not a continuation/blank.
+
+    A meaningful row has either:
+      * 3+ non-empty cells (typical of a fully extracted transaction), OR
+      * a money-like cell AND some non-money cell (e.g. "Balance B/F" + amount).
+    Continuation rows ("Lagos/539923", "Reference: ...", "Card: ****") have
+    only ONE populated cell and no money — they should not inflate the score
+    of a candidate that has 100s of them.
+    """
+    non_empty = [str(c).strip() for c in row if str(c or "").strip()]
+    if len(non_empty) >= 3:
+        return True
+    if _row_has_money(row) and any(not _MONEY_CELL_RE.match(s) for s in non_empty):
+        return True
+    return False
+
+
+def _table_quality_score(
+    tbl: list[list[str]],
+    preferred_header: list[str] | None = None,
+) -> float:
     """Rank a candidate table by how much it looks like a usable transaction list.
 
     Hard gates:
@@ -1042,7 +1121,14 @@ def _table_quality_score(tbl: list[list[str]]) -> float:
       * at least 3 distinct columns must be populated in the body.
     Tables failing any gate score 0, which eliminates pdfplumber's
     text-strategy output from random PDF prose (e.g. address block at the top
-    of a Revolut statement) that otherwise wins on raw row count."""
+    of a Revolut statement) that otherwise wins on raw row count.
+
+    `preferred_header` (when supplied) gives a HUGE bonus to candidates whose
+    column structure (count + names) matches a header we've already locked in
+    from a previous page. This prevents a different pdfplumber strategy on
+    page 2 from collapsing 'TransDate' and 'Reference' into one column,
+    silently shifting all subsequent money values one column to the left.
+    """
     if not tbl or len(tbl) < 2:
         return 0.0
     header = tbl[0]
@@ -1052,10 +1138,16 @@ def _table_quality_score(tbl: list[list[str]]) -> float:
         return 0.0
 
     col_fill = [0] * width
+    money_rows = 0
+    meaningful_rows = 0
     for r in body:
         for i, c in enumerate(r[:width]):
             if c is not None and str(c).strip():
                 col_fill[i] += 1
+        if _row_has_money(r):
+            money_rows += 1
+        if _row_is_meaningful(r):
+            meaningful_rows += 1
     populated_cols = sum(1 for c in col_fill if c > 0)
     if populated_cols < 3:
         return 0.0
@@ -1077,16 +1169,53 @@ def _table_quality_score(tbl: list[list[str]]) -> float:
         return 0.0
 
     body_rows = min(len(body), 300)
-    return populated_cols * 5 + body_rows + hdr_hits * 40
+    money_rows_capped = min(money_rows, 300)
+    meaningful_rows_capped = min(meaningful_rows, 300)
+
+    # Base score: weight MEANINGFUL rows much higher than raw row count so a
+    # 100-row mostly-empty candidate cannot beat a 30-row clean one.
+    score = (
+        populated_cols * 5
+        + meaningful_rows_capped * 6
+        + money_rows_capped * 4
+        + body_rows * 0.2
+        + hdr_hits * 40
+    )
+
+    # Structural-match bonus: prefer candidates whose header matches the
+    # first-page header exactly (same column count, same canonicalised names).
+    if preferred_header is not None and header is not None:
+        if len(header) == len(preferred_header):
+            score += 200
+            pref_norm = [_norm_col(str(c)) for c in preferred_header]
+            same_names = sum(1 for a, b in zip(hdr_norm, pref_norm) if a == b and a)
+            score += same_names * 50
+        else:
+            # A column-count mismatch is the failure mode that causes the
+            # debit/credit shift. Apply a strong penalty so a structurally
+            # correct candidate always wins.
+            score -= 300
+
+    return score
 
 
-def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
+def _extract_tables_from_pdf_page(
+    page,
+    preferred_header: list[str] | None = None,
+) -> list[list[list[str]]]:
     """Return the single best transaction-like table for a page (list-wrapped).
 
     Runs a word-position reconstructor plus several pdfplumber strategies and
     picks the highest-scoring candidate. This generalises across statements
     that extract cleanly with ruled tables (e.g. FirstBank) and ones with no
-    table lines at all (e.g. Revolut)."""
+    table lines at all (e.g. Revolut).
+
+    `preferred_header` is the column header that won on a previous page of the
+    same document. When supplied, candidates that share the same column
+    structure get a large scoring bonus so the per-page selection stays
+    consistent across the document — without this, pdfplumber's text strategy
+    on page 2 of a FirstBank statement happily merges 'TransDate Reference'
+    into one column and shifts every money value left by one."""
     candidates: list[list[list[str]]] = []
     seen: set[tuple[str, ...]] = set()
 
@@ -1124,8 +1253,8 @@ def _extract_tables_from_pdf_page(page) -> list[list[list[str]]]:
 
     if not candidates:
         return []
-    best = max(candidates, key=_table_quality_score)
-    return [best] if _table_quality_score(best) > 0 else []
+    best = max(candidates, key=lambda t: _table_quality_score(t, preferred_header))
+    return [best] if _table_quality_score(best, preferred_header) > 0 else []
 
 
 def _merge_flat_rows_from_tables(page_tables: list[list[list[str]]]) -> list[list[str]]:
@@ -1205,11 +1334,18 @@ def _load_pdf_tables_and_text(content: bytes) -> tuple[pd.DataFrame, str]:
                 pages_processed += 1
 
                 chunk: list[list[str]] = []
+                # Lock onto the first page's header so subsequent pages must
+                # produce a candidate with the same column structure. Without
+                # this, pdfplumber's per-page strategy can pick a different
+                # column count on page N and silently shift money values.
+                preferred_header = all_rows[0] if all_rows else None
                 if page_text.strip() or has_chars:
                     pages_with_text += 1
                     text_chunks.append(page_text)
                     try:
-                        page_tables = _extract_tables_from_pdf_page(page)
+                        page_tables = _extract_tables_from_pdf_page(
+                            page, preferred_header=preferred_header
+                        )
                     except Exception:
                         page_tables = []
                     if page_tables:
@@ -2257,6 +2393,13 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     if "description" not in df.columns:
         df["description"] = ""
 
+    # Strip trailing pollution from date cells before parsing. Word-position
+    # parsers occasionally merge text from the next visual line (e.g.
+    # "31-JAN-23 END OF STATEMENT" or "Mar 27, 2026 Page 6 of 14") into the
+    # date column. pd.to_datetime("31-JAN-23 END OF STATEMENT") returns NaT
+    # and the row gets dropped, silently losing a real transaction. Pull
+    # just the leading date pattern out of the cell first.
+    df["date"] = df["date"].apply(_extract_leading_date)
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
     df = df[df["date"].notna()].copy()
     if df.empty:
