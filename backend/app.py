@@ -1366,6 +1366,286 @@ def _read_excel_flexible(content: bytes) -> tuple[pd.DataFrame, str]:
     )
 
 
+def _vision_extraction_enabled() -> bool:
+    """Decide whether to use GPT-4o vision as the primary PDF extractor.
+
+    Defaults to ON whenever an OPENAI_API_KEY is available because vision
+    extraction is dramatically more accurate than the heuristic pdfplumber
+    pipeline on real-world bank statements (Revolut, Wise, Taptap, etc.)
+    where there are no table grid lines and column x-ranges drift across
+    pages. Operators can opt out by setting USE_VISION_EXTRACTION=0.
+    """
+    if OpenAI is None or pdfium is None:
+        return False
+    if not os.getenv("OPENAI_API_KEY"):
+        return False
+    raw = os.getenv("USE_VISION_EXTRACTION", "auto").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _vision_model() -> str:
+    """Model used for vision-based statement extraction.
+
+    `gpt-4o-mini` is the default — it is multimodal, accurate enough for
+    table reading on bank statements, and cheap (~$0.005-0.015 / page).
+    Override with VISION_MODEL=gpt-4o for harder layouts.
+    """
+    return os.getenv("VISION_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+
+def _vision_max_pages() -> int:
+    try:
+        return max(1, int(os.getenv("VISION_MAX_PAGES", "40")))
+    except ValueError:
+        return 40
+
+
+def _vision_render_dpi() -> int:
+    try:
+        return max(120, min(300, int(os.getenv("VISION_DPI", "180"))))
+    except ValueError:
+        return 180
+
+
+_VISION_PROMPT = """You are extracting transactions from one page of a bank statement.
+
+Return STRICT JSON with this exact shape:
+{
+  "currency": "ISO-4217 code or symbol if visible (e.g. EUR, USD, GBP, NGN, €, $); empty string if unclear",
+  "transactions": [
+    {
+      "date": "YYYY-MM-DD if you can normalise it, otherwise the original string",
+      "description": "merchant / counterparty / reference text exactly as printed",
+      "money_out": <number or null>,
+      "money_in":  <number or null>,
+      "balance":   <number or null>
+    }
+  ]
+}
+
+CRITICAL RULES — read carefully:
+1. Extract ONLY individual transaction rows from the main transaction table.
+2. DO NOT include:
+   - Balance summary rows ("Opening balance", "Closing balance", "Total", "Money out total", etc.).
+   - Pending / not-yet-posted transactions (often in a separate "Pending" section).
+   - Page subtotals, carry-forward lines, headers, footers, or marketing text.
+3. "money_out" = withdrawal / debit / payment / outflow / spending.
+   "money_in"  = deposit / credit / payment received / inflow / income.
+   If a row has only one amount, decide which column it belongs to by looking at
+   its horizontal position relative to the column headers — DO NOT GUESS.
+4. Numbers must be JSON numbers (e.g. 1234.56), no currency symbols, no commas,
+   no parentheses. Use null when a column is blank for that row.
+5. If a transaction description spans multiple lines, join them into one
+   description string; the row still has exactly one money_out / money_in /
+   balance triple.
+6. If the page has no transaction rows at all, return {"currency": "...", "transactions": []}.
+7. Output JSON only — no prose, no markdown, no code fences.
+"""
+
+
+def _render_page_to_png_b64(pdf_doc, page_idx: int, dpi: int) -> str | None:
+    """Render one PDF page to PNG and return a base64 data URL, or None on failure."""
+    if pdfium is None:
+        return None
+    try:
+        if page_idx >= len(pdf_doc):
+            return None
+        page = pdf_doc[page_idx]
+    except Exception:
+        return None
+    bitmap = None
+    img = None
+    try:
+        scale = dpi / 72.0
+        try:
+            bitmap = page.render(scale=scale)
+            img = bitmap.to_pil()
+        except Exception as render_err:
+            print(f"[vision] render failed page {page_idx + 1}: {render_err!r}")
+            return None
+        finally:
+            if bitmap is not None:
+                try:
+                    bitmap.close()
+                except Exception:
+                    pass
+        buf = io.BytesIO()
+        try:
+            img.convert("RGB").save(buf, format="PNG", optimize=True)
+        except Exception as save_err:
+            print(f"[vision] PNG encode failed page {page_idx + 1}: {save_err!r}")
+            return None
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def _coerce_vision_amount(raw: object) -> float | None:
+    """Coerce a model-returned amount to float, accepting numbers and strings."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(v) else v
+    return _parse_money(raw)
+
+
+def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
+    """Extract transactions from a PDF using GPT-4o vision.
+
+    Renders each page to PNG, sends it to the multimodal model with a strict
+    JSON schema, and concatenates the per-page transaction lists into a
+    single DataFrame with canonical columns: date / description / debit /
+    credit / balance.
+
+    Returns None when:
+      * The OPENAI_API_KEY is not set or vision is explicitly disabled,
+      * pypdfium2 is not installed,
+      * Every page failed to extract any transactions (caller should then
+        fall back to the heuristic pdfplumber pipeline).
+    """
+    if not _vision_extraction_enabled():
+        return None
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        print(f"[vision] OpenAI client init failed: {e!r}")
+        return None
+
+    try:
+        pdf_doc = pdfium.PdfDocument(content)
+    except Exception as e:
+        print(f"[vision] pdfium open failed: {e!r}")
+        return None
+
+    model = _vision_model()
+    dpi = _vision_render_dpi()
+    max_pages = min(_vision_max_pages(), _max_pdf_pages())
+    n_pages = min(len(pdf_doc), max_pages)
+    print(f"[vision] using model={model} dpi={dpi} pages={n_pages}/{len(pdf_doc)}")
+
+    rows: list[dict] = []
+    text_chunks: list[str] = []
+    detected_currency: str = ""
+    pages_with_rows = 0
+
+    try:
+        for page_idx in range(n_pages):
+            data_url = _render_page_to_png_b64(pdf_doc, page_idx, dpi)
+            if data_url is None:
+                continue
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": _VISION_PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": data_url, "detail": "high"},
+                                },
+                            ],
+                        }
+                    ],
+                )
+            except Exception as api_err:
+                print(f"[vision] page {page_idx + 1}: API call failed: {api_err!r}")
+                continue
+
+            content_str = (resp.choices[0].message.content or "").strip()
+            if not content_str:
+                continue
+            try:
+                data = json.loads(content_str)
+            except json.JSONDecodeError:
+                # The model occasionally wraps JSON in code fences despite the
+                # response_format hint; strip the most common wrapping then retry.
+                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content_str, flags=re.S)
+                try:
+                    data = json.loads(cleaned)
+                except Exception as parse_err:
+                    print(f"[vision] page {page_idx + 1}: JSON parse failed: {parse_err!r}")
+                    continue
+
+            if not detected_currency:
+                cur = str(data.get("currency", "")).strip()
+                if cur:
+                    detected_currency = cur
+
+            txns = data.get("transactions") or []
+            if not isinstance(txns, list):
+                continue
+            page_count = 0
+            for t in txns:
+                if not isinstance(t, dict):
+                    continue
+                date_raw = t.get("date")
+                description = t.get("description") or ""
+                money_out = _coerce_vision_amount(t.get("money_out"))
+                money_in = _coerce_vision_amount(t.get("money_in"))
+                balance = _coerce_vision_amount(t.get("balance"))
+                if date_raw is None and money_out is None and money_in is None:
+                    continue
+                rows.append(
+                    {
+                        "date": str(date_raw or "").strip(),
+                        "description": str(description).strip(),
+                        "debit": money_out,
+                        "credit": money_in,
+                        "balance": balance,
+                    }
+                )
+                page_count += 1
+            if page_count:
+                pages_with_rows += 1
+            text_chunks.append(
+                f"[Page {page_idx + 1}] " + json.dumps(txns, ensure_ascii=False)[:4000]
+            )
+            print(f"[vision] page {page_idx + 1}: {page_count} transaction(s)")
+    finally:
+        try:
+            pdf_doc.close()
+        except Exception:
+            pass
+
+    if not rows:
+        print("[vision] no transactions extracted on any page; will fall back to heuristic")
+        return None
+
+    df = pd.DataFrame(rows)
+    if detected_currency:
+        df.attrs["__detected_currency__"] = detected_currency
+    text = "\n".join(text_chunks).strip()
+    print(
+        f"[vision] extracted {len(rows)} transaction(s) "
+        f"from {pages_with_rows}/{n_pages} page(s)"
+    )
+    return df, text
+
+
 def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix == ".csv":
@@ -1373,6 +1653,18 @@ def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str
     if suffix in {".xlsx", ".xls"}:
         return _read_excel_flexible(content)
     if suffix == ".pdf":
+        # Prefer GPT-4o vision when an API key is available — it handles
+        # complex layouts (Revolut summary tables, multi-line descriptions,
+        # IBAN-laden references, scanned pages) far more reliably than the
+        # heuristic pdfplumber/OCR pipeline. Fall through to the heuristic
+        # path on any failure or when vision is disabled.
+        try:
+            vision_result = _vision_extract_pdf(content)
+        except Exception as e:
+            print(f"[vision] unexpected error, falling back to heuristic: {e!r}")
+            vision_result = None
+        if vision_result is not None:
+            return vision_result
         return _load_pdf_tables_and_text(content)
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or Excel.")
 
@@ -1411,6 +1703,44 @@ CURRENCY_CODE_RE = re.compile(
     r"KRW|BRL|MXN|RUB|PLN|TRY|ILS|AED|SAR|QAR|CZK|HUF|RON|IDR|THB|MYR|PHP|VND|"
     r"PKR|BDT|NGN|KES|GHS|EGP|MAD|TWD|UAH|ARS|COP|CLP|PEN|ISK|BGN|HRK)\b"
 )
+
+
+def _normalise_currency_hint(raw: str) -> str:
+    """Map a free-form currency hint (symbol, code, or word) to an ISO-4217 code.
+
+    Used to clean up the `currency` field that GPT-4o vision returns — it may
+    answer with "€", "EUR", "Euro", or "Euros" and we want a single code in
+    the analytics payload."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    if s in CURRENCY_SYMBOLS:
+        return CURRENCY_SYMBOLS[s]
+    upper = s.upper()
+    for prefix, code in CURRENCY_DOLLAR_PREFIX.items():
+        if upper == prefix.upper():
+            return code
+    m = CURRENCY_CODE_RE.search(upper)
+    if m:
+        code = m.group(1)
+        return "CNY" if code == "RMB" else code
+    word_map = {
+        "EURO": "EUR", "EUROS": "EUR",
+        "POUND": "GBP", "POUNDS": "GBP", "STERLING": "GBP",
+        "DOLLAR": "USD", "DOLLARS": "USD",
+        "YEN": "JPY",
+        "RUPEE": "INR", "RUPEES": "INR",
+        "NAIRA": "NGN",
+        "RAND": "ZAR",
+        "FRANC": "CHF", "FRANCS": "CHF",
+    }
+    if upper in word_map:
+        return word_map[upper]
+    if upper.startswith("$"):
+        return "USD"
+    return ""
 
 
 def _detect_currency(source_text: str, df: pd.DataFrame | None) -> str:
@@ -1974,6 +2304,28 @@ def ocr_status() -> dict:
     }
 
 
+@app.get("/api/vision-status")
+def vision_status() -> dict:
+    """Diagnostics: confirms whether GPT-4o vision PDF extraction is active.
+
+    `enabled` is true when an OPENAI_API_KEY is set, the OpenAI SDK and
+    pypdfium2 are importable, and USE_VISION_EXTRACTION isn't set to off.
+    When this is true, PDF uploads are read by the vision model first."""
+    return {
+        "enabled": _vision_extraction_enabled(),
+        "model": _vision_model(),
+        "openai_sdk_installed": OpenAI is not None,
+        "pypdfium2_installed": pdfium is not None,
+        "openai_api_key_set": bool(os.getenv("OPENAI_API_KEY")),
+        "env": {
+            "USE_VISION_EXTRACTION": os.getenv("USE_VISION_EXTRACTION", "auto"),
+            "VISION_MODEL": os.getenv("VISION_MODEL"),
+            "VISION_DPI": os.getenv("VISION_DPI"),
+            "VISION_MAX_PAGES": os.getenv("VISION_MAX_PAGES"),
+        },
+    }
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """Avoid 404 on GET / (browsers, probes, Render health checks sometimes hit /)."""
@@ -2004,7 +2356,12 @@ async def upload(file: UploadFile = File(...)) -> dict:
 
     try:
         df_raw, source_text = _load_dataframe(file, content)
-        detected_currency = _detect_currency(source_text, df_raw)
+        # If the vision extractor identified the currency, prefer that over
+        # the heuristic text-scan detector — it has read the actual statement
+        # header rather than guessing from symbol counts.
+        vision_currency_raw = str(df_raw.attrs.get("__detected_currency__", "")).strip()
+        vision_currency = _normalise_currency_hint(vision_currency_raw)
+        detected_currency = vision_currency or _detect_currency(source_text, df_raw)
         df, _ = _prepare_financial_df(df_raw)
         currency = detected_currency
         analytics = _build_analytics(df, currency)
