@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import io
+import json
 import os
 import re
 import uuid
@@ -221,6 +223,54 @@ def _norm_col(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(name).strip().lower()).strip()
 
 
+# Realistic upper bound for any single bank-statement money cell.
+# Anything above this is almost certainly a parser misalignment that
+# concatenated an account number, IBAN, URI, reference ID, or several
+# adjacent cells into one string. Set high enough to allow legitimate
+# corporate balances but low enough to catch garbage like a 16-digit
+# IBAN being mis-parsed as 1,974,466,163,048,739.
+_MAX_REALISTIC_MONEY = 1e10
+
+# Heuristic: an IBAN-ish or account-number-ish token is mostly digits
+# (>=10) with no decimal separator and either uppercase letters mixed in
+# (IBAN starts with 2 letters) or a length that exceeds any plausible
+# money amount. We refuse to treat these as money.
+_IBAN_LIKE_RE = re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{6,}$")
+
+
+def _looks_like_account_or_id(raw: str) -> bool:
+    """Return True if `raw` looks like an IBAN, account number, card mask,
+    URI, or other long identifier rather than a monetary amount.
+
+    These tokens regularly appear in bank-statement description fields and,
+    when they accidentally bleed into the money column due to layout drift,
+    would otherwise be parsed as huge fake amounts (e.g. a 16-char IBAN
+    becoming a 16-digit "balance" of 1.97e15).
+    """
+    s = raw.strip()
+    if not s:
+        return False
+    upper = s.upper()
+    # Pure IBAN pattern (e.g. BE89967667468985, FI8239390027899731).
+    compact = re.sub(r"\s+", "", upper)
+    if _IBAN_LIKE_RE.match(compact):
+        return True
+    # Anything beginning with /URI/ comes from pdfplumber link annotations.
+    if "/URI/" in upper or upper.startswith("URI/"):
+        return True
+    # Card mask like 535456******4398.
+    if "*" in s and re.search(r"\d", s):
+        return True
+    # If letters and digits coexist AND there's no decimal separator AND
+    # the digit run is long, it is overwhelmingly an identifier, not money.
+    has_letter = bool(re.search(r"[A-Za-z]", s))
+    has_money_cue = bool(re.search(r"[€$£¥₹₦.,]", s))
+    digit_run = max((len(g) for g in re.findall(r"\d+", s)), default=0)
+    if has_letter and not has_money_cue and digit_run >= 9:
+        return True
+    return False
+
+
 def _parse_money(val: object) -> float | None:
     """Parse a single money cell, robust to:
       * Currency symbols / words (€, $, £, EUR, USD, ...)
@@ -228,7 +278,9 @@ def _parse_money(val: object) -> float | None:
       * Parentheses for negatives, e.g. "(123.45)"
       * Trailing "DR" (debit/negative) and "CR" (credit/positive) markers
       * Spaces, NBSPs, blank cells.
-    Returns None for unparseable / empty cells.
+    Returns None for unparseable / empty cells, and ALSO None for cells
+    that look like account numbers / IBANs / URIs / IDs rather than money
+    — see `_looks_like_account_or_id` for the rationale.
     """
     if val is None:
         return None
@@ -237,11 +289,20 @@ def _parse_money(val: object) -> float | None:
             f = float(val)
         except (TypeError, ValueError):
             return None
-        return None if pd.isna(f) else f
+        if pd.isna(f):
+            return None
+        if abs(f) > _MAX_REALISTIC_MONEY:
+            return None
+        return f
 
-    s = str(val).strip().replace("\u00a0", " ")
-    if not s or s in {"-", "—", "–", "nan", "NaN", "None"}:
+    raw = str(val).strip().replace("\u00a0", " ")
+    if not raw or raw in {"-", "—", "–", "nan", "NaN", "None"}:
         return None
+
+    if _looks_like_account_or_id(raw):
+        return None
+
+    s = raw
 
     is_neg = False
     if "(" in s and ")" in s:
@@ -277,6 +338,15 @@ def _parse_money(val: object) -> float | None:
         n = float(s)
     except ValueError:
         return None
+
+    # Final sanity gate: a digit-only token with no decimal separator and a
+    # long digit run is almost certainly an identifier (account number,
+    # reference, phone, IBAN with letters stripped earlier). Reject it.
+    if "." not in s and len(s) >= 12:
+        return None
+    if abs(n) > _MAX_REALISTIC_MONEY:
+        return None
+
     return -n if is_neg else n
 
 
@@ -1429,6 +1499,17 @@ def _prepare_financial_df(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     for column in ("debit", "credit", "amount", "balance"):
         if column in df.columns:
             df[column] = _to_float(df[column])
+            # Defence-in-depth: even if _parse_money let something absurd
+            # through (e.g. via a bespoke formatter we haven't seen), zero
+            # out cells beyond the realistic money range so that one bad
+            # row cannot dominate the total income / expense card.
+            mask_absurd = df[column].abs() > _MAX_REALISTIC_MONEY
+            if mask_absurd.any():
+                print(
+                    f"[sanity] {column}: zeroing {int(mask_absurd.sum())} cell(s) "
+                    f"with absurd magnitude (>{_MAX_REALISTIC_MONEY:.0e})"
+                )
+                df.loc[mask_absurd, column] = pd.NA
 
     has_debit = "debit" in df.columns
     has_credit = "credit" in df.columns
