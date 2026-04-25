@@ -296,7 +296,7 @@ Routes are defined in [`backend/app.py`](backend/app.py).
 1. `FileUpload` posts the file to `POST /api/upload`.
 2. `_load_dataframe` dispatches by content type:
    - CSV / XLSX: pandas reads directly.
-   - PDF: `_load_pdf_tables_and_text` walks every page. For text pages it runs `_extract_tables_from_pdf_page` (which tries several pdfplumber strategies + a word-position reconstruction, scored by `_table_quality_score`). For image-only pages it renders with pypdfium2 and OCRs with Tesseract, then feeds the OCR words into the same `_extract_transactions_from_words` parser.
+   - PDF: `_load_pdf_dataframe` runs BOTH the heuristic (`_load_pdf_tables_and_text`: pdfplumber strategies + word-position reconstruction + Tesseract OCR fallback, scored by `_table_quality_score`) AND, when configured, the GPT-4o vision extractor (`_vision_extract_pdf`). It then scores each candidate's totals against the statement's printed self-check (Total Credit / Total Debit / Opening / Closing balance via `_extract_printed_totals`) and the running-balance arithmetic (`_extraction_quality_score`), and keeps whichever extraction agrees best with the bank's own numbers.
 3. `_detect_currency` scans the raw text + column headers for currency hints.
 4. `_prepare_financial_df` normalizes columns (amount, date, description, category) and cleans rows.
 5. `_build_analytics` computes the summary cards, category breakdown, and daily spending series.

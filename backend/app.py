@@ -413,16 +413,45 @@ def _match_money_column_by_tokens(normalized: str) -> str | None:
     return best_match[1] if best_match else None
 
 
+def _column_text_population(df: pd.DataFrame, col: object) -> tuple[int, float]:
+    """Return (non-empty row count, average text length of non-empty rows).
+
+    Used to break ties between several columns that all alias to
+    `description`. On a FirstBank statement the raw frame has both
+    `Reference` (often blank) and `Transaction Details` (the real
+    narrative), and we want the populated one to win the description
+    slot — otherwise the dashboard shows an empty description column
+    even though the parser correctly extracted the text.
+    """
+    try:
+        ser = df[col]
+    except Exception:
+        return 0, 0.0
+    if isinstance(ser, pd.DataFrame):
+        # Duplicate column names — collapse to the first non-empty value.
+        ser = ser.bfill(axis=1).iloc[:, 0]
+    s = ser.astype(str).fillna("").str.strip()
+    mask = s.ne("") & s.str.lower().ne("nan") & s.str.lower().ne("none")
+    non_empty = int(mask.sum())
+    if non_empty == 0:
+        return 0, 0.0
+    avg_len = float(s[mask].str.len().mean())
+    return non_empty, avg_len
+
+
 def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     renames: dict[str, str] = {}
-    description_loosely_assigned = False
     claimed: set[str] = set()
 
-    # Pass 1: strict exact / alias match — preserve previous behaviour for
-    # clean headers so nothing regresses.
+    # Pass 1: strict exact / alias match for every canonical column EXCEPT
+    # description. We defer description so we can pick the most-populated
+    # candidate when several columns alias to it (Reference vs Transaction
+    # Details vs Narrative on the same statement).
     for col in df.columns:
         normalized = _norm_col(str(col))
         for canonical, aliases in CANONICAL_COLUMNS.items():
+            if canonical == "description":
+                continue
             if canonical in claimed:
                 continue
             if normalized == canonical or normalized in aliases:
@@ -442,7 +471,28 @@ def _canonicalise_columns(df: pd.DataFrame) -> pd.DataFrame:
             renames[col] = fuzzy
             claimed.add(fuzzy)
 
-    # Pass 3: loose fallbacks for date / description if still missing.
+    # Pass 3: description — pick the alias-matching column with the most
+    # populated text content, breaking ties by average text length. This
+    # prevents an empty 'Reference' column from claiming 'description' and
+    # leaving the real narrative ('Transaction Details') unmapped, which
+    # used to wipe the description column on FirstBank-style statements.
+    description_aliases = CANONICAL_COLUMNS["description"]
+    description_candidates: list[tuple[int, float, object]] = []
+    for col in df.columns:
+        if col in renames:
+            continue
+        normalized = _norm_col(str(col))
+        if normalized == "description" or normalized in description_aliases:
+            non_empty, avg_len = _column_text_population(df, col)
+            description_candidates.append((non_empty, avg_len, col))
+    if description_candidates:
+        description_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        winner = description_candidates[0][2]
+        renames[winner] = "description"
+        claimed.add("description")
+
+    # Pass 4: loose fallbacks for date / description if still missing.
+    description_loosely_assigned = "description" in claimed
     for col in df.columns:
         if col in renames:
             continue
@@ -2034,6 +2084,190 @@ def _vision_extract_pdf(content: bytes) -> tuple[pd.DataFrame, str] | None:
     return df, text
 
 
+# Patterns for printed Total Credit / Total Debit / Opening / Closing values
+# in the statement summary box. Most banks print these as a self-check ahead
+# of the transaction list (FirstBank, GTB, UBA, Stanbic, Revolut summary,
+# Wise, etc.). When present, they are GROUND TRUTH for our extraction —
+# if our column-attributed totals disagree with the printed numbers, the
+# extractor got something wrong (most often debit/credit misclassification
+# on a column-dense PDF).
+_PRINTED_MONEY_RE = r"([\(\-]?[\d][\d,\.\s]{0,18}[\d](?:\.\d{2})?\)?)"
+_PRINTED_TOTALS_PATTERNS: dict[str, str] = {
+    "total_credit": (
+        rf"total\s+(?:credits?|deposits?|money\s+in|inflows?|paid[\s\-]*in)"
+        rf"\s*[:\-]?\s*[A-Z]{{0,3}}\$?[€£¥₹₦]?\s*{_PRINTED_MONEY_RE}"
+    ),
+    "total_debit": (
+        rf"total\s+(?:debits?|withdrawals?|money\s+out|outflows?|paid[\s\-]*out)"
+        rf"\s*[:\-]?\s*[A-Z]{{0,3}}\$?[€£¥₹₦]?\s*{_PRINTED_MONEY_RE}"
+    ),
+    "opening_balance": (
+        rf"(?:opening|starting|beginning|balance\s+b[/\\]?f|brought\s+forward)"
+        rf"\s*(?:balance)?\s*[:\-]?\s*[A-Z]{{0,3}}\$?[€£¥₹₦]?\s*{_PRINTED_MONEY_RE}"
+    ),
+    "closing_balance": (
+        rf"(?:closing|ending|final)\s+balance"
+        rf"\s*[:\-]?\s*[A-Z]{{0,3}}\$?[€£¥₹₦]?\s*{_PRINTED_MONEY_RE}"
+    ),
+}
+
+
+def _extract_printed_totals(source_text: str) -> dict[str, float]:
+    """Pull printed Total Credit / Total Debit / Opening / Closing balance
+    values out of the statement summary text.
+
+    Returns a dict that may contain any subset of the four keys. Values
+    that don't parse as money or look like account-id noise are skipped.
+    Used as ground-truth input to `_extraction_quality_score` so we can
+    detect when the active extractor (vision OR heuristic) silently
+    misclassified debits as credits and produced wrong dashboard totals.
+    """
+    out: dict[str, float] = {}
+    if not source_text:
+        return out
+    for key, pat in _PRINTED_TOTALS_PATTERNS.items():
+        for m in re.finditer(pat, source_text, re.IGNORECASE):
+            val = _parse_money(m.group(1))
+            if val is None:
+                continue
+            # Take the first sane occurrence; statement summaries print
+            # these once at the top of the document.
+            out[key] = abs(val)
+            break
+    return out
+
+
+def _extraction_quality_score(
+    df: pd.DataFrame,
+    printed: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Score an extracted transaction frame for arithmetic consistency.
+
+    Two signals:
+      1. Running-balance chain: every consecutive pair of populated
+         balances should satisfy   delta == credit - debit   within a
+         small tolerance.
+      2. Printed totals (when available): sum(credit) and sum(debit)
+         should match the Total Credit / Total Debit values printed in
+         the statement summary.
+
+    Returns a dict with diagnostic fields and an `overall` 0..1 score.
+    Higher is better. Used by `_load_dataframe` to pick between the
+    vision and heuristic PDF extractors when both produce candidate
+    frames for the same upload.
+    """
+    n = int(len(df))
+    has_balance = "balance" in df.columns
+    has_credit = "credit" in df.columns
+    has_debit = "debit" in df.columns
+
+    if has_balance:
+        bal = pd.to_numeric(df["balance"], errors="coerce")
+    else:
+        bal = pd.Series([], dtype=float)
+
+    if has_credit:
+        cr = pd.to_numeric(df["credit"], errors="coerce").fillna(0.0)
+    else:
+        cr = pd.Series([0.0] * n)
+    if has_debit:
+        dr = pd.to_numeric(df["debit"], errors="coerce").fillna(0.0)
+    else:
+        dr = pd.Series([0.0] * n)
+
+    pairs = 0
+    holds = 0
+    prev: float | None = None
+    for i in range(len(bal)):
+        v = bal.iat[i]
+        if pd.isna(v):
+            continue
+        if prev is not None:
+            delta = float(v) - prev
+            signed = float(cr.iat[i]) - float(dr.iat[i])
+            tol = max(0.05, 0.001 * abs(prev))
+            pairs += 1
+            if abs(delta - signed) <= tol:
+                holds += 1
+        prev = float(v)
+    chain_score = (holds / pairs) if pairs else 0.0
+    chain_breaks = pairs - holds
+
+    total_cr = float(cr.sum()) if len(cr) else 0.0
+    total_dr = float(dr.sum()) if len(dr) else 0.0
+
+    printed_cr_diff: float = float("nan")
+    printed_dr_diff: float = float("nan")
+    printed_score: float | None = None
+    if printed:
+        scores: list[float] = []
+        if "total_credit" in printed:
+            ref = max(printed["total_credit"], 1.0)
+            printed_cr_diff = abs(total_cr - printed["total_credit"])
+            # Within 1% of printed = 1.0; >=10% off = 0.0; linear in between.
+            scores.append(max(0.0, 1.0 - max(0.0, printed_cr_diff / ref - 0.01) / 0.09))
+        if "total_debit" in printed:
+            ref = max(printed["total_debit"], 1.0)
+            printed_dr_diff = abs(total_dr - printed["total_debit"])
+            scores.append(max(0.0, 1.0 - max(0.0, printed_dr_diff / ref - 0.01) / 0.09))
+        if scores:
+            printed_score = sum(scores) / len(scores)
+
+    # Also enforce the implicit identity (closing - opening) == credit - debit
+    # when the summary prints opening + closing balances. This catches
+    # extractors that lose entire rows (printed totals usually catch this
+    # too, but not every bank prints both).
+    implicit_score: float | None = None
+    if printed and "opening_balance" in printed and "closing_balance" in printed:
+        expected_delta = printed["closing_balance"] - printed["opening_balance"]
+        actual_delta = total_cr - total_dr
+        ref = max(abs(expected_delta), abs(printed["opening_balance"]), 1.0)
+        diff = abs(actual_delta - expected_delta)
+        implicit_score = max(0.0, 1.0 - max(0.0, diff / ref - 0.01) / 0.09)
+
+    components: list[tuple[float, float]] = []
+    if printed_score is not None:
+        components.append((0.6, printed_score))
+    if implicit_score is not None:
+        components.append((0.25, implicit_score))
+    components.append((1.0 - sum(w for w, _ in components), chain_score))
+    overall = sum(w * s for w, s in components if w > 0)
+
+    return {
+        "rows": float(n),
+        "balance_rows": float(int(bal.notna().sum()) if len(bal) else 0),
+        "pairs": float(pairs),
+        "chain_breaks": float(chain_breaks),
+        "chain_score": float(chain_score),
+        "total_credit": total_cr,
+        "total_debit": total_dr,
+        "printed_credit_diff": printed_cr_diff,
+        "printed_debit_diff": printed_dr_diff,
+        "printed_score": float(printed_score) if printed_score is not None else float("nan"),
+        "implicit_score": float(implicit_score) if implicit_score is not None else float("nan"),
+        "overall": float(overall),
+    }
+
+
+def _score_pdf_candidate(df_raw: pd.DataFrame, source_text: str) -> dict[str, float] | None:
+    """Run `_prepare_financial_df` on a candidate frame and score the result.
+
+    Returns None when the candidate cannot even be normalised into a
+    transaction table (no date column, empty rows, etc.) — the caller
+    treats that as a 0-score candidate and falls back to the other one.
+    """
+    try:
+        prepared, _ = _prepare_financial_df(df_raw.copy())
+    except HTTPException as e:
+        print(f"[extract] candidate failed _prepare_financial_df: {e.detail}")
+        return None
+    except Exception as e:
+        print(f"[extract] candidate failed _prepare_financial_df: {e!r}")
+        return None
+    printed = _extract_printed_totals(source_text)
+    return _extraction_quality_score(prepared, printed)
+
+
 def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix == ".csv":
@@ -2041,20 +2275,93 @@ def _load_dataframe(file: UploadFile, content: bytes) -> tuple[pd.DataFrame, str
     if suffix in {".xlsx", ".xls"}:
         return _read_excel_flexible(content)
     if suffix == ".pdf":
-        # Prefer GPT-4o vision when an API key is available — it handles
-        # complex layouts (Revolut summary tables, multi-line descriptions,
-        # IBAN-laden references, scanned pages) far more reliably than the
-        # heuristic pdfplumber/OCR pipeline. Fall through to the heuristic
-        # path on any failure or when vision is disabled.
-        try:
-            vision_result = _vision_extract_pdf(content)
-        except Exception as e:
-            print(f"[vision] unexpected error, falling back to heuristic: {e!r}")
-            vision_result = None
-        if vision_result is not None:
-            return vision_result
-        return _load_pdf_tables_and_text(content)
+        return _load_pdf_dataframe(content)
     raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or Excel.")
+
+
+def _load_pdf_dataframe(content: bytes) -> tuple[pd.DataFrame, str]:
+    """Run BOTH the heuristic and (when available) GPT-4o vision PDF
+    extractors and pick whichever produces totals that best match the
+    statement's own printed self-check (Total Credit / Total Debit /
+    Opening / Closing balance) and the running-balance chain.
+
+    Why both? Each path has failure modes the other one tends to avoid:
+      * Vision (gpt-4o-mini) handles Revolut-style PDFs with no grid
+        lines, multi-line descriptions, and scanned pages cleanly, but
+        occasionally misclassifies a column-dense layout (e.g. FirstBank
+        Nigeria's adjacent Deposit / Withdrawal columns) and silently
+        shifts amounts between credit and debit.
+      * Heuristic (pdfplumber + word-position + OCR fallback) is exact
+        on PDFs with proper table grids OR consistent x-aligned columns,
+        but fails on documents with no rules at all.
+
+    Cost: vision was already called on every PDF before; heuristic is
+    free. Running heuristic too costs a few seconds at most and gives us
+    a verified-against-summary answer.
+    """
+    candidates: list[tuple[str, pd.DataFrame, str, dict[str, float]]] = []
+
+    # 1) Heuristic — always attempt; cheap and exact on rule-based PDFs.
+    h_text = ""
+    try:
+        h_df, h_text = _load_pdf_tables_and_text(content)
+    except HTTPException as e:
+        print(f"[extract] heuristic raised: {e.detail}")
+        h_df = None
+    except Exception as e:
+        print(f"[extract] heuristic crashed: {e!r}")
+        h_df = None
+
+    if h_df is not None:
+        score = _score_pdf_candidate(h_df, h_text)
+        if score is not None:
+            candidates.append(("heuristic", h_df, h_text, score))
+            print(
+                f"[extract] heuristic score={score['overall']:.3f} "
+                f"(printed={score['printed_score']:.3f}, "
+                f"chain={score['chain_score']:.3f}, breaks={int(score['chain_breaks'])}, "
+                f"rows={int(score['rows'])}, "
+                f"credit={score['total_credit']:.2f}, debit={score['total_debit']:.2f})"
+            )
+
+    # 2) Vision — only when configured. Reuse heuristic source text for
+    # printed-totals comparison because the model returns per-page JSON
+    # rather than the verbatim summary text.
+    vision_result = None
+    try:
+        vision_result = _vision_extract_pdf(content)
+    except Exception as e:
+        print(f"[extract] vision crashed: {e!r}")
+
+    if vision_result is not None:
+        v_df, v_text = vision_result
+        scoring_text = h_text or v_text
+        score = _score_pdf_candidate(v_df, scoring_text)
+        if score is not None:
+            candidates.append(("vision", v_df, v_text, score))
+            print(
+                f"[extract] vision    score={score['overall']:.3f} "
+                f"(printed={score['printed_score']:.3f}, "
+                f"chain={score['chain_score']:.3f}, breaks={int(score['chain_breaks'])}, "
+                f"rows={int(score['rows'])}, "
+                f"credit={score['total_credit']:.2f}, debit={score['total_debit']:.2f})"
+            )
+
+    if not candidates:
+        # Both paths failed — re-run heuristic so its HTTPException with
+        # the actionable hint propagates to the caller.
+        return _load_pdf_tables_and_text(content)
+
+    best = max(candidates, key=lambda c: c[3]["overall"])
+    if len(candidates) > 1:
+        runner = min(candidates, key=lambda c: c[3]["overall"])
+        print(
+            f"[extract] picked {best[0]} "
+            f"(overall={best[3]['overall']:.3f} > {runner[0]} {runner[3]['overall']:.3f})"
+        )
+    else:
+        print(f"[extract] only {best[0]} succeeded (overall={best[3]['overall']:.3f})")
+    return best[1], best[2]
 
 
 CURRENCY_SYMBOLS: dict[str, str] = {
